@@ -19,8 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 async def process_pending_requests():
-    """Main worker loop."""
+    """Main worker loop — dispatches pending requests concurrently.
+
+    Each request is processed in its own asyncio task so video gen polling
+    (which can take 5-10 minutes) doesn't block other requests.
+
+    The _active_requests set prevents the same request from being picked up
+    again on the next loop iteration while it's still processing.
+    """
     client = get_flow_client()
+    _active_requests: set[str] = set()
 
     while True:
         try:
@@ -30,11 +38,23 @@ async def process_pending_requests():
 
             pending = await crud.list_pending_requests()
             for req in pending:
-                await _process_one(client, req)
+                rid = req["id"]
+                if rid in _active_requests:
+                    continue  # Already processing in a concurrent task
+                _active_requests.add(rid)
+                asyncio.create_task(_process_one_tracked(client, req, _active_requests))
         except Exception as e:
             logger.exception("Worker loop error: %s", e)
 
         await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _process_one_tracked(client, req: dict, active: set):
+    """Wrapper that removes request from active set when done."""
+    try:
+        await _process_one(client, req)
+    finally:
+        active.discard(req["id"])
 
 
 async def _process_one(client, req: dict):
@@ -231,12 +251,14 @@ async def _poll_operations(client, operations: list[dict], timeout: int = VIDEO_
 
     poll_interval = POLL_INTERVAL
     elapsed = 0
+    # Use latest operations for each poll — API returns updated status/metadata
+    current_ops = operations
 
     while elapsed < timeout:
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
 
-        status_result = await client.check_video_status(operations)
+        status_result = await client.check_video_status(current_ops)
         if _is_error(status_result):
             logger.warning("Status poll error: %s", status_result.get("error"))
             continue
@@ -246,6 +268,9 @@ async def _poll_operations(client, operations: list[dict], timeout: int = VIDEO_
 
         if not ops:
             continue
+
+        # Update current_ops with latest response for next poll iteration
+        current_ops = ops
 
         all_done = True
         has_error = False
