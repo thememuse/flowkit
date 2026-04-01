@@ -37,11 +37,12 @@ class FlowClient:
         """Called when extension disconnects."""
         self._extension_ws = None
         # Cancel all pending futures
+        count = len(self._pending)
         for req_id, future in self._pending.items():
             if not future.done():
                 future.set_exception(ConnectionError("Extension disconnected"))
         self._pending.clear()
-        logger.warning("Extension disconnected, cleared %d pending requests", len(self._pending))
+        logger.warning("Extension disconnected, cleared %d pending requests", count)
 
     def set_flow_key(self, key: str):
         self._flow_key = key
@@ -62,6 +63,12 @@ class FlowClient:
             return
 
         if data.get("type") == "pong":
+            return
+
+        if data.get("type") == "ping":
+            # Respond to keepalive
+            if self._extension_ws:
+                await self._extension_ws.send(json.dumps({"type": "pong"}))
             return
 
         # Response to a pending request

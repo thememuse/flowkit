@@ -233,7 +233,15 @@ async function handleApiRequest(msg) {
       const captchaResult = await solveCaptcha(id, captchaAction);
       captchaToken = captchaResult?.token || null;
       if (!captchaToken) {
-        console.warn(`[FlowAgent] No captcha token for ${captchaAction}:`, captchaResult?.error);
+        // Cannot proceed without captcha — API will 403
+        const err = captchaResult?.error || 'CAPTCHA_FAILED';
+        console.error(`[FlowAgent] Captcha failed for ${captchaAction}: ${err}`);
+        sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
+        metrics.failedCount++;
+        metrics.lastError = `CAPTCHA_FAILED: ${err}`;
+        chrome.storage.local.set({ metrics });
+        setState('idle');
+        return;
       }
     }
 

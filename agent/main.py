@@ -15,6 +15,7 @@ from agent.api.projects import router as projects_router
 from agent.api.videos import router as videos_router
 from agent.api.scenes import router as scenes_router
 from agent.api.requests import router as requests_router
+from agent.api.flow import router as flow_router
 from agent.worker.processor import process_pending_requests
 from agent.services.flow_client import get_flow_client
 
@@ -86,6 +87,7 @@ app.include_router(projects_router, prefix="/api")
 app.include_router(videos_router, prefix="/api")
 app.include_router(scenes_router, prefix="/api")
 app.include_router(requests_router, prefix="/api")
+app.include_router(flow_router, prefix="/api")
 
 
 @app.get("/health")
