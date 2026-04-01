@@ -48,21 +48,20 @@ def merge_videos(video_paths: list[str], output_path: str) -> bool:
 
 
 def add_music(video_path: str, music_path: str, output_path: str,
-              music_volume: float = 0.3, fade_out_duration: float = 3.0) -> bool:
+              music_volume: float = 0.3, fade_in: float = 2.0, fade_out: float = 3.0) -> bool:
     """Overlay background music on video."""
-    # Get video duration
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
         capture_output=True, text=True,
     )
     duration = float(probe.stdout.strip())
-    fade_start = max(0, duration - fade_out_duration)
+    fade_start = max(0, duration - fade_out)
 
     cmd = [
         "ffmpeg", "-y", "-i", video_path, "-i", music_path,
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         "-filter_complex",
-        f"[0:a]volume=1.0[orig];[1:a]volume={music_volume},afade=t=in:st=0:d=2,afade=t=out:st={fade_start}:d={fade_out_duration}[music];[orig][music]amerge=inputs=2,pan=stereo|c0=c0+c2|c1=c1+c3[aout]",
+        f"[0:a]volume=1.0[orig];[1:a]volume={music_volume},afade=t=in:st=0:d={fade_in},afade=t=out:st={fade_start}:d={fade_out}[music];[orig][music]amerge=inputs=2,pan=stereo|c0=c0+c2|c1=c1+c3[aout]",
         "-map", "0:v", "-map", "[aout]",
         "-shortest",
         "-movflags", "+faststart",

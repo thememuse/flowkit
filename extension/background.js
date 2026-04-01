@@ -1,251 +1,360 @@
 /**
  * Google Flow Agent — Chrome Extension Background Service Worker
- * 
- * Responsibilities:
- * 1. Capture Google Flow bearer token (ya29.*) from aisandbox-pa.googleapis.com
- * 2. Solve reCAPTCHA v2 when required
- * 3. Provide WebSocket server for local agent to call Google Flow APIs
- * 4. Wrap all Google Flow API endpoints
+ *
+ * Connects to local Python agent via WebSocket (agent runs WS server).
+ * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-const FLOW_API = 'https://aisandbox-pa.googleapis.com';
+const AGENT_WS_URL = 'ws://127.0.0.1:9222';
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
-const RECAPTCHA_SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 
-let flowKey = null; // Bearer token ya29.*
-let wsPort = 9222;
-let metrics = { tokenCapturedAt: null, requestCount: 0, lastError: null };
+let ws = null;
+let flowKey = null;
+let state = 'off'; // off | idle | running
+let metrics = {
+  tokenCapturedAt: null,
+  requestCount: 0,
+  successCount: 0,
+  failedCount: 0,
+  lastError: null,
+};
+
+// ─── Startup ────────────────────────────────────────────────
+
+chrome.runtime.onInstalled.addListener(init);
+chrome.runtime.onStartup.addListener(init);
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'reconnect') connectToAgent();
+  if (alarm.name === 'keepAlive') keepAlive();
+});
+
+async function init() {
+  const data = await chrome.storage.local.get(['flowKey', 'metrics']);
+  if (data.flowKey) flowKey = data.flowKey;
+  if (data.metrics) Object.assign(metrics, data.metrics);
+  connectToAgent();
+  chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
+}
 
 // ─── Token Capture ──────────────────────────────────────────
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (!details?.requestHeaders?.length) return;
-    const authHeader = details.requestHeaders.find(h => h.name?.toLowerCase() === 'authorization');
+    const authHeader = details.requestHeaders.find(
+      (h) => h.name?.toLowerCase() === 'authorization',
+    );
     const value = authHeader?.value || '';
     if (!value.startsWith('Bearer ya29.')) return;
-    
+
     const token = value.replace(/^Bearer\s+/i, '').trim();
-    if (token === flowKey) return;
-    
+    if (!token || token === flowKey) return;
+
     flowKey = token;
     metrics.tokenCapturedAt = Date.now();
     chrome.storage.local.set({ flowKey, metrics });
     console.log('[FlowAgent] Bearer token captured');
+
+    // Notify agent
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+    }
   },
   { urls: ['https://aisandbox-pa.googleapis.com/*'] },
-  ['requestHeaders']
+  ['requestHeaders', 'extraHeaders'],
 );
 
-// ─── Google Flow API Wrapper ────────────────────────────────
+// ─── WebSocket to Agent ─────────────────────────────────────
 
-async function callFlowAPI(path, body, method = 'POST') {
-  if (!flowKey) throw new Error('No bearer token — open Google Labs first');
-  
-  const url = `${FLOW_API}${path}${path.includes('?') ? '&' : '?'}key=${API_KEY}`;
-  const resp = await fetch(url, {
-    method,
-    headers: {
-      'Authorization': `Bearer ${flowKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: method !== 'GET' ? JSON.stringify(body) : undefined,
+function connectToAgent() {
+  if (ws?.readyState === WebSocket.CONNECTING) return;
+  if (ws?.readyState === WebSocket.OPEN) return;
+
+  try {
+    ws = new WebSocket(AGENT_WS_URL);
+  } catch (e) {
+    console.error('[FlowAgent] WS connect error:', e);
+    scheduleReconnect();
+    return;
+  }
+
+  ws.onopen = () => {
+    console.log('[FlowAgent] Connected to agent');
+    chrome.alarms.clear('reconnect');
+    setState('idle');
+
+    // Send current state
+    ws.send(JSON.stringify({
+      type: 'extension_ready',
+      flowKeyPresent: !!flowKey,
+      tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+    }));
+  };
+
+  ws.onmessage = async ({ data }) => {
+    try {
+      const msg = JSON.parse(data);
+
+      if (msg.method === 'api_request') {
+        await handleApiRequest(msg);
+      } else if (msg.method === 'solve_captcha') {
+        await handleSolveCaptcha(msg);
+      } else if (msg.method === 'get_status') {
+        sendToAgent({
+          id: msg.id,
+          result: {
+            state,
+            flowKeyPresent: !!flowKey,
+            tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+            metrics,
+          },
+        });
+      } else if (msg.type === 'pong') {
+        // keepalive response
+      }
+    } catch (e) {
+      console.error('[FlowAgent] Message error:', e);
+    }
+  };
+
+  ws.onclose = () => {
+    setState('off');
+    scheduleReconnect();
+  };
+
+  ws.onerror = (e) => {
+    console.error('[FlowAgent] WS error:', e);
+    metrics.lastError = 'WS_ERROR';
+    chrome.storage.local.set({ metrics });
+  };
+}
+
+function scheduleReconnect() {
+  chrome.alarms.create('reconnect', { delayInMinutes: 0.083 }); // ~5s
+}
+
+function keepAlive() {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'ping' }));
+  } else {
+    connectToAgent();
+  }
+}
+
+function sendToAgent(msg) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+// ─── reCAPTCHA Solving ──────────────────────────────────────
+
+async function requestCaptchaFromTab(tabId, requestId, pageAction) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_CAPTCHA',
+      requestId,
+      pageAction,
+    });
+  } catch (error) {
+    const msg = error?.message || '';
+    const shouldInject =
+      msg.includes('Receiving end does not exist') ||
+      msg.includes('Could not establish connection');
+    if (!shouldInject) throw error;
+
+    // Inject content script and retry
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content.js'],
+    });
+    await sleep(200);
+    return await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_CAPTCHA',
+      requestId,
+      pageAction,
+    });
+  }
+}
+
+async function solveCaptcha(requestId, captchaAction) {
+  const tabs = await chrome.tabs.query({
+    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
   });
-  
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Flow API ${resp.status}: ${err.slice(0, 200)}`);
+
+  if (!tabs.length) {
+    return { error: 'NO_FLOW_TAB' };
   }
-  return resp.json();
+
+  try {
+    const resp = await Promise.race([
+      requestCaptchaFromTab(tabs[0].id, requestId, captchaAction),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
+    ]);
+    return resp;
+  } catch (e) {
+    return { error: e.message };
+  }
 }
 
-async function generateImage(params) {
-  const { prompt, characters, orientation } = params;
-  const aspectRatio = orientation === 'HORIZONTAL' ? '16:9' : '9:16';
-  
-  // Build character references
-  const charRefs = (characters || [])
-    .filter(c => c.media_gen_id)
-    .map(c => ({ mediaGenerationId: c.media_gen_id }));
-  
-  const body = {
-    generationRequest: {
-      prompt: prompt,
-      aspectRatio: aspectRatio,
-      numOutputs: 1,
-      ...(charRefs.length > 0 && { characterReferences: charRefs }),
-    },
-  };
-  
-  const result = await callFlowAPI('/v1/images:generate', body);
-  const generated = result?.generatedImages?.[0] || {};
-  
-  return {
-    mediaGenerationId: generated.mediaGenerationId || '',
-    imageUrl: generated.imageUri || '',
-  };
+async function handleSolveCaptcha(msg) {
+  const { id, params } = msg;
+  const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
+
+  if (result?.token) {
+    metrics.successCount++;
+  } else {
+    metrics.failedCount++;
+    metrics.lastError = result?.error || 'NO_TOKEN';
+  }
+  chrome.storage.local.set({ metrics });
+
+  sendToAgent({ id, result });
 }
 
-async function generateVideo(params) {
-  const { mediaGenerationId, prompt, orientation, endSceneMediaGenerationId, model } = params;
-  const aspectRatio = orientation === 'HORIZONTAL' ? '16:9' : '9:16';
-  
-  const body = {
-    generationRequest: {
-      imageMediaGenerationId: mediaGenerationId,
-      prompt: prompt,
-      aspectRatio: aspectRatio,
-      model: model || 'veo_3_1_fast',
-      ...(endSceneMediaGenerationId && { endSceneMediaGenerationId }),
-    },
-  };
-  
-  // Submit generation
-  const submit = await callFlowAPI('/v1/videos:generate', body);
-  const operationId = submit?.operationId || submit?.name;
-  
-  if (!operationId) {
-    return { mediaGenerationId: submit?.mediaGenerationId || '', videoUrl: '' };
+// ─── API Request Proxy ──────────────────────────────────────
+
+async function handleApiRequest(msg) {
+  const { id, params } = msg;
+  const { url, method, headers, body, captchaAction } = params;
+
+  if (!url) {
+    sendToAgent({ id, error: 'MISSING_URL' });
+    return;
   }
-  
-  // Poll for completion
-  for (let i = 0; i < 60; i++) {
-    await new Promise(r => setTimeout(r, 5000));
-    try {
-      const status = await callFlowAPI(`/v1/operations/${operationId}`, null, 'GET');
-      if (status?.done) {
-        const video = status?.response?.generatedVideos?.[0] || {};
-        return {
-          mediaGenerationId: video.mediaGenerationId || '',
-          videoUrl: video.videoUri || '',
-        };
+
+  setState('running');
+  metrics.requestCount++;
+
+  try {
+    // Step 1: Solve captcha if needed
+    let captchaToken = null;
+    if (captchaAction) {
+      const captchaResult = await solveCaptcha(id, captchaAction);
+      captchaToken = captchaResult?.token || null;
+      if (!captchaToken) {
+        console.warn(`[FlowAgent] No captcha token for ${captchaAction}:`, captchaResult?.error);
       }
-    } catch (e) {
-      console.warn('[FlowAgent] Poll error:', e.message);
     }
-  }
-  return { error: 'Video generation timeout' };
-}
 
-async function upscaleVideo(params) {
-  const { mediaGenerationId, orientation, resolution } = params;
-  
-  const body = {
-    mediaGenerationId: mediaGenerationId,
-    resolution: resolution || 'VIDEO_RESOLUTION_4K',
-  };
-  
-  const submit = await callFlowAPI('/v1/videos:upscale', body);
-  const operationId = submit?.operationId || submit?.name;
-  
-  if (!operationId) {
-    return { mediaGenerationId: submit?.mediaGenerationId || '', videoUrl: '' };
-  }
-  
-  // Poll
-  for (let i = 0; i < 40; i++) {
-    await new Promise(r => setTimeout(r, 5000));
-    try {
-      const status = await callFlowAPI(`/v1/operations/${operationId}`, null, 'GET');
-      if (status?.done) {
-        const video = status?.response || {};
-        return {
-          mediaGenerationId: video.mediaGenerationId || '',
-          videoUrl: video.videoUri || '',
-        };
+    // Step 2: Inject captcha token into body
+    let finalBody = body;
+    if (captchaToken && finalBody) {
+      finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
+      if (finalBody.clientContext?.recaptchaContext) {
+        finalBody.clientContext.recaptchaContext.token = captchaToken;
       }
-    } catch (e) {
-      console.warn('[FlowAgent] Upscale poll error:', e.message);
+      if (finalBody.requests && Array.isArray(finalBody.requests)) {
+        for (const req of finalBody.requests) {
+          if (req.clientContext?.recaptchaContext) {
+            req.clientContext.recaptchaContext.token = captchaToken;
+          }
+        }
+      }
     }
+
+    // Step 3: Use flowKey for auth
+    const activeFlowKey = flowKey;
+    if (!activeFlowKey) {
+      sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
+      metrics.failedCount++;
+      metrics.lastError = 'NO_FLOW_KEY';
+      chrome.storage.local.set({ metrics });
+      setState('idle');
+      return;
+    }
+
+    const fetchHeaders = { ...(headers || {}) };
+    fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+
+    // Step 4: Make the API call from browser context
+    const response = await fetch(url, {
+      method: method || 'POST',
+      headers: fetchHeaders,
+      credentials: 'include',
+      body: method === 'GET' ? undefined : JSON.stringify(finalBody),
+    });
+
+    let responseData;
+    const responseText = await response.text();
+    try {
+      responseData = JSON.parse(responseText);
+    } catch {
+      responseData = responseText;
+    }
+
+    sendToAgent({
+      id,
+      status: response.status,
+      data: responseData,
+    });
+
+    if (response.ok) {
+      metrics.successCount++;
+      metrics.lastError = null;
+    } else {
+      metrics.failedCount++;
+      metrics.lastError = `API_${response.status}`;
+    }
+  } catch (e) {
+    sendToAgent({
+      id,
+      status: 500,
+      error: e.message || 'API_REQUEST_FAILED',
+    });
+    metrics.failedCount++;
+    metrics.lastError = e.message;
   }
-  return { error: 'Upscale timeout' };
+
+  chrome.storage.local.set({ metrics });
+  setState('idle');
 }
 
-async function generateCharacterImage(params) {
-  const { name, description } = params;
-  const body = {
-    generationRequest: {
-      prompt: `Character reference: ${name}. ${description}`,
-      aspectRatio: '1:1',
-      numOutputs: 1,
-    },
-  };
-  
-  const result = await callFlowAPI('/v1/images:generate', body);
-  const generated = result?.generatedImages?.[0] || {};
-  
-  return {
-    mediaGenerationId: generated.mediaGenerationId || '',
-    imageUrl: generated.imageUri || '',
-  };
+// ─── State & Popup ──────────────────────────────────────────
+
+function setState(newState) {
+  state = newState;
+  const badges = { idle: '●', running: '▶', off: '○' };
+  const colors = { idle: '#22c55e', running: '#f59e0b', off: '#6b7280' };
+  chrome.action.setBadgeText({ text: badges[state] || '' });
+  chrome.action.setBadgeBackgroundColor({ color: colors[state] || '#000' });
+  broadcastStatus();
 }
 
-async function getCredits() {
-  const result = await callFlowAPI('/v1/credits', null, 'GET');
-  return result;
+function broadcastStatus() {
+  chrome.runtime.sendMessage({ type: 'STATUS_PUSH' }).catch(() => {});
 }
 
-// ─── Method Router ──────────────────────────────────────────
+chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'STATUS') {
+    reply({
+      state,
+      agentConnected: ws?.readyState === WebSocket.OPEN,
+      flowKeyPresent: !!flowKey,
+      tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+      metrics,
+    });
+  }
 
-const METHODS = {
-  generate_image: generateImage,
-  generate_video: generateVideo,
-  upscale_video: upscaleVideo,
-  generate_character_image: generateCharacterImage,
-  get_credits: getCredits,
-};
-
-// ─── WebSocket Bridge (via content script relay) ────────────
-// Since service workers can't run a WS server, we use chrome.runtime messaging
-// The local agent connects via a native messaging host or HTTP polling
-
-chrome.runtime.onMessageExternal.addListener(async (msg, sender, sendResponse) => {
-  const { requestId, method, params } = msg;
-  const handler = METHODS[method];
-  
-  if (!handler) {
-    sendResponse({ requestId, error: `Unknown method: ${method}` });
+  if (msg.type === 'TEST_CAPTCHA') {
+    solveCaptcha(`test-${Date.now()}`, msg.pageAction || 'IMAGE_GENERATION')
+      .then((r) => reply(r))
+      .catch((e) => reply({ error: e.message }));
     return true;
   }
-  
-  try {
-    metrics.requestCount++;
-    const result = await handler(params || {});
-    sendResponse({ requestId, ...result });
-  } catch (e) {
-    metrics.lastError = e.message;
-    sendResponse({ requestId, error: e.message });
+
+  if (msg.type === 'OPEN_FLOW_TAB') {
+    chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow' })
+      .then(() => reply({ ok: true }))
+      .catch((e) => reply({ error: e.message }));
+    return true;
   }
+
   return true;
 });
 
-// Also handle internal messages from popup
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'getStatus') {
-    sendResponse({
-      connected: !!flowKey,
-      tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
-      requestCount: metrics.requestCount,
-      lastError: metrics.lastError,
-    });
-    return true;
-  }
-  
-  if (msg.type === 'apiCall') {
-    const handler = METHODS[msg.method];
-    if (!handler) {
-      sendResponse({ error: `Unknown method: ${msg.method}` });
-      return true;
-    }
-    handler(msg.params || {}).then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
-    return true;
-  }
-});
-
-// Restore token on startup
-chrome.storage.local.get(['flowKey', 'metrics'], (data) => {
-  if (data.flowKey) flowKey = data.flowKey;
-  if (data.metrics) Object.assign(metrics, data.metrics);
-});
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 console.log('[FlowAgent] Extension loaded');

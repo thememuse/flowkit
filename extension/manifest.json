@@ -1,25 +1,34 @@
 {
   "manifest_version": 3,
   "name": "Google Flow Agent",
-  "version": "0.1.0",
-  "description": "Captures Google Flow bearer token and provides API bridge for local agent",
-  "permissions": ["webRequest", "storage", "alarms"],
+  "version": "0.2.0",
+  "description": "Local agent bridge for Google Flow API — captures tokens, solves reCAPTCHA, proxies API calls",
+  "permissions": ["storage", "alarms", "tabs", "webRequest", "scripting"],
   "host_permissions": [
-    "https://aisandbox-pa.googleapis.com/*",
-    "https://labs.google/*"
+    "https://labs.google/*",
+    "https://aisandbox-pa.googleapis.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
-  "action": {
-    "default_popup": "popup.html",
-    "default_icon": "icon48.png"
-  },
   "content_scripts": [
     {
-      "matches": ["https://labs.google/*"],
+      "matches": [
+        "https://labs.google/fx/tools/flow*",
+        "https://labs.google/fx/*/tools/flow*"
+      ],
       "js": ["content.js"],
       "run_at": "document_start"
     }
-  ]
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://labs.google/*"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Google Flow Agent"
+  }
 }

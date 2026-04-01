@@ -1,14 +1,15 @@
 from pydantic import BaseModel
 from typing import Optional
+from agent.models.enums import RequestType, Orientation
 
 
 class RequestCreate(BaseModel):
+    type: RequestType
+    orientation: Optional[Orientation] = None
     scene_id: Optional[str] = None
     character_id: Optional[str] = None
     project_id: Optional[str] = None
     video_id: Optional[str] = None
-    type: str  # GENERATE_IMAGES | GENERATE_VIDEO | UPSCALE_VIDEO | GENERATE_CHARACTER_IMAGE
-    orientation: Optional[str] = None  # VERTICAL | HORIZONTAL
 
 
 class Request(BaseModel):

@@ -11,12 +11,20 @@
     .stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 11px; }
     .label { color: #8b949e; }
     .value { color: #e0e0e0; font-weight: 600; }
+    button { margin-top: 8px; padding: 6px 12px; background: #238636; color: #fff; border: none;
+             border-radius: 6px; cursor: pointer; font-size: 11px; width: 100%; }
+    button:hover { background: #2ea043; }
+    button.secondary { background: #30363d; }
+    button.secondary:hover { background: #484f58; }
   </style>
 </head>
 <body>
   <h2>🔗 Google Flow Agent</h2>
-  <div id="status" class="status disconnected">Checking...</div>
+  <div id="agent-status" class="status disconnected">Checking...</div>
+  <div id="token-status" class="status disconnected">No token</div>
   <div id="stats"></div>
+  <button id="btn-test" class="secondary">🧪 Test Captcha</button>
+  <button id="btn-flow">🌐 Open Flow Tab</button>
   <script src="popup.js"></script>
 </body>
 </html>
