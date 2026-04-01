@@ -26,7 +26,7 @@ async def get(pid: str):
 
 @router.patch("/{pid}", response_model=Project)
 async def update(pid: str, body: ProjectUpdate):
-    p = await crud.update_project(pid, **body.model_dump(exclude_none=True))
+    p = await crud.update_project(pid, **body.model_dump(exclude_unset=True))
     if not p:
         raise HTTPException(404, "Project not found")
     return p

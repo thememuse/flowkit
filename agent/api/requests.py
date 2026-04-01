@@ -41,7 +41,7 @@ async def get(rid: str):
 
 @router.patch("/{rid}", response_model=Request)
 async def update(rid: str, body: RequestUpdate):
-    data = body.model_dump(exclude_none=True)
+    data = body.model_dump(exclude_unset=True)
     if not data:
         raise HTTPException(400, "No fields to update")
     r = await crud.update_request(rid, **data)

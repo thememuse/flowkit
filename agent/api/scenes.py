@@ -38,7 +38,9 @@ async def get(sid: str):
 
 @router.patch("/{sid}", response_model=Scene)
 async def update(sid: str, body: SceneUpdate):
-    data = body.model_dump(exclude_none=True)
+    # Use exclude_unset (not exclude_none) so explicit null clears fields
+    # e.g. {"vertical_video_url": null} → sets DB column to NULL
+    data = body.model_dump(exclude_unset=True)
     if "character_names" in data and isinstance(data["character_names"], list):
         data["character_names"] = json.dumps(data["character_names"])
     s = await crud.update_scene(sid, **data)

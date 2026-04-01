@@ -25,7 +25,7 @@ async def get(vid: str):
 
 @router.patch("/{vid}", response_model=Video)
 async def update(vid: str, body: VideoUpdate):
-    v = await crud.update_video(vid, **body.model_dump(exclude_none=True))
+    v = await crud.update_video(vid, **body.model_dump(exclude_unset=True))
     if not v:
         raise HTTPException(404, "Video not found")
     return v

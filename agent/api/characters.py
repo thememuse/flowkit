@@ -25,7 +25,7 @@ async def get(cid: str):
 
 @router.patch("/{cid}", response_model=Character)
 async def update(cid: str, body: CharacterUpdate):
-    c = await crud.update_character(cid, **body.model_dump(exclude_none=True))
+    c = await crud.update_character(cid, **body.model_dump(exclude_unset=True))
     if not c:
         raise HTTPException(404, "Character not found")
     return c
