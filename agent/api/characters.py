@@ -1,23 +1,31 @@
 from fastapi import APIRouter, HTTPException
 from agent.models.character import Character, CharacterCreate, CharacterUpdate
-from agent.db import crud
+from agent.sdk.persistence.sqlite_repository import SQLiteRepository
 
 router = APIRouter(prefix="/characters", tags=["characters"])
 
 
+def _get_repo() -> SQLiteRepository:
+    return SQLiteRepository()
+
+
 @router.post("", response_model=Character)
 async def create(body: CharacterCreate):
-    return await crud.create_character(**body.model_dump(exclude_none=True))
+    repo = _get_repo()
+    return await repo.create_character(**body.model_dump(exclude_none=True))
 
 
 @router.get("", response_model=list[Character])
 async def list_all():
-    return await crud.list_characters()
+    repo = _get_repo()
+    rows = await repo.list("character", order_by="created_at DESC")
+    return [repo._row_to_character(r) for r in rows]
 
 
 @router.get("/{cid}", response_model=Character)
 async def get(cid: str):
-    c = await crud.get_character(cid)
+    repo = _get_repo()
+    c = await repo.get_character(cid)
     if not c:
         raise HTTPException(404, "Character not found")
     return c
@@ -25,14 +33,16 @@ async def get(cid: str):
 
 @router.patch("/{cid}", response_model=Character)
 async def update(cid: str, body: CharacterUpdate):
-    c = await crud.update_character(cid, **body.model_dump(exclude_unset=True))
-    if not c:
+    repo = _get_repo()
+    row = await repo.update("character", cid, **body.model_dump(exclude_unset=True))
+    if not row:
         raise HTTPException(404, "Character not found")
-    return c
+    return repo._row_to_character(row)
 
 
 @router.delete("/{cid}")
 async def delete(cid: str):
-    if not await crud.delete_character(cid):
+    repo = _get_repo()
+    if not await repo.delete_character(cid):
         raise HTTPException(404, "Character not found")
     return {"ok": True}

@@ -2,7 +2,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from agent.models.project import Project, ProjectCreate, ProjectUpdate
 from agent.models.character import Character
-from agent.db import crud
+from agent.sdk.persistence.sqlite_repository import SQLiteRepository
 from agent.services.flow_client import get_flow_client
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,10 @@ async def _detect_user_tier(client) -> str:
         return "PAYGATE_TIER_ONE"
 
 
+def _get_repo() -> SQLiteRepository:
+    return SQLiteRepository()
+
+
 @router.post("", response_model=Project)
 async def create(body: ProjectCreate):
     # Step 1: Create project on Google Flow to get the real projectId
@@ -101,14 +105,12 @@ async def create(body: ProjectCreate):
             dupes = [n for n in names if names.count(n) > 1]
             raise HTTPException(400, f"Duplicate character names: {list(set(dupes))}")
 
-    # Auto-detect tier if not explicitly set (default was TIER_TWO which may be wrong)
     detected_tier = await _detect_user_tier(client)
 
     flow_result = await client.create_project(body.name, body.tool_name)
     if flow_result.get("error"):
         raise HTTPException(502, f"Flow API error: {flow_result['error']}")
 
-    # Extract projectId from tRPC response
     try:
         data = flow_result.get("data", {})
         result = data["result"]["data"]["json"]["result"]
@@ -119,13 +121,21 @@ async def create(body: ProjectCreate):
 
     logger.info("Flow project created: %s", flow_project_id)
 
+    repo = _get_repo()
+
     # Step 2: Create local project with the Flow-assigned ID and detected tier
     create_data = body.model_dump(exclude_none=True)
     create_data.pop("tool_name", None)
     characters_input = create_data.pop("characters", None)
-    create_data["id"] = flow_project_id
-    create_data["user_paygate_tier"] = detected_tier
-    project = await crud.create_project(**create_data)
+
+    project = await repo.create_project(
+        id=flow_project_id,
+        name=create_data["name"],
+        description=create_data.get("description"),
+        story=create_data.get("story"),
+        language=create_data.get("language", "en"),
+        user_paygate_tier=detected_tier,
+    )
 
     # Step 3: Create reference entities (characters, locations, assets) with profiles
     if characters_input:
@@ -149,27 +159,30 @@ async def create(body: ProjectCreate):
                     f"{composition} "
                     f"Studio lighting, highly detailed"
                 )
-            char = await crud.create_character(
+            char = await repo.create_character(
                 name=char_input["name"],
                 entity_type=etype,
                 description=description,
                 image_prompt=image_prompt,
                 voice_description=char_input.get("voice_description"),
             )
-            await crud.link_character_to_project(flow_project_id, char["id"])
-            logger.info("%s '%s' created and linked: %s", etype, char_input["name"], char["id"])
+            await repo.link_character_to_project(flow_project_id, char.id)
+            logger.info("%s '%s' created and linked: %s", etype, char_input["name"], char.id)
 
     return project
 
 
 @router.get("", response_model=list[Project])
 async def list_all(status: str = None):
-    return await crud.list_projects(status)
+    repo = _get_repo()
+    rows = await repo.list("project", **({} if status is None else {"status": status}))
+    return [repo._row_to_project(r) for r in rows]
 
 
 @router.get("/{pid}", response_model=Project)
 async def get(pid: str):
-    p = await crud.get_project(pid)
+    repo = _get_repo()
+    p = await repo.get_project(pid)
     if not p:
         raise HTTPException(404, "Project not found")
     return p
@@ -177,33 +190,38 @@ async def get(pid: str):
 
 @router.patch("/{pid}", response_model=Project)
 async def update(pid: str, body: ProjectUpdate):
-    p = await crud.update_project(pid, **body.model_dump(exclude_unset=True))
-    if not p:
+    repo = _get_repo()
+    row = await repo.update("project", pid, **body.model_dump(exclude_unset=True))
+    if not row:
         raise HTTPException(404, "Project not found")
-    return p
+    return repo._row_to_project(row)
 
 
 @router.delete("/{pid}")
 async def delete(pid: str):
-    if not await crud.delete_project(pid):
+    repo = _get_repo()
+    if not await repo.delete_project(pid):
         raise HTTPException(404, "Project not found")
     return {"ok": True}
 
 
 @router.post("/{pid}/characters/{cid}")
 async def link_character(pid: str, cid: str):
-    if not await crud.link_character_to_project(pid, cid):
+    repo = _get_repo()
+    if not await repo.link_character_to_project(pid, cid):
         raise HTTPException(400, "Failed to link character")
     return {"ok": True}
 
 
 @router.delete("/{pid}/characters/{cid}")
 async def unlink_character(pid: str, cid: str):
-    if not await crud.unlink_character_from_project(pid, cid):
+    repo = _get_repo()
+    if not await repo.unlink_character_from_project(pid, cid):
         raise HTTPException(404, "Link not found")
     return {"ok": True}
 
 
 @router.get("/{pid}/characters", response_model=list[Character])
 async def get_characters(pid: str):
-    return await crud.get_project_characters(pid)
+    repo = _get_repo()
+    return await repo.get_project_characters(pid)

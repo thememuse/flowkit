@@ -107,7 +107,7 @@ class Scene(DomainModel):
         from agent.sdk.services.operations import get_operations
 
         ops = get_operations()
-        return await ops.generate_scene_image(
+        return await ops.queue_scene_image(
             scene_id=self.id,
             project_id=project_id,
             video_id=video_id or self.video_id,
@@ -128,7 +128,7 @@ class Scene(DomainModel):
 
         slot = self.vertical if orientation == "VERTICAL" else self.horizontal
         ops = get_operations()
-        return await ops.edit_scene_image(
+        return await ops.queue_edit_scene_image(
             scene_id=self.id,
             project_id=project_id,
             video_id=video_id or self.video_id,
@@ -148,7 +148,7 @@ class Scene(DomainModel):
         from agent.sdk.services.operations import get_operations
 
         ops = get_operations()
-        return await ops.generate_scene_video(
+        return await ops.queue_scene_video(
             scene_id=self.id,
             project_id=project_id,
             video_id=video_id or self.video_id,
@@ -166,7 +166,7 @@ class Scene(DomainModel):
         from agent.sdk.services.operations import get_operations
 
         ops = get_operations()
-        return await ops.upscale_scene_video(
+        return await ops.queue_upscale_video(
             scene_id=self.id,
             project_id=project_id,
             video_id=video_id or self.video_id,
