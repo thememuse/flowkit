@@ -476,9 +476,13 @@ async def _upload_character_image(client, char: dict, project_id: str) -> str | 
         return None
 
     try:
-        # Download image
+        # Download image (skip SSL verify — macOS Python often lacks root certs for GCS)
+        import ssl
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
         async with aiohttp.ClientSession() as session:
-            async with session.get(ref_url) as resp:
+            async with session.get(ref_url, ssl=ssl_ctx) as resp:
                 if resp.status != 200:
                     logger.error("Failed to download character image: HTTP %d", resp.status)
                     return None
@@ -766,12 +770,31 @@ async def _handle_generate_character_image(client, req: dict) -> dict:
         return {"error": "Character not found"}
 
     pid = req.get("project_id", "0")
+    entity_type = char.get("entity_type", "character")
+
+    # ── Fast path: image already generated, just need media_id ──
+    # If reference_image_url exists but media_id is missing, the image was
+    # already generated on a previous attempt — skip generation (saves credits)
+    # and just retry upload for UUID.
+    existing_url = char.get("reference_image_url")
+    if existing_url and not char.get("media_id"):
+        logger.info("%s '%s' already has image, retrying upload only (saving credits)", entity_type, char["name"])
+        upload_mid = await _upload_character_image(client, {
+            "name": char["name"],
+            "reference_image_url": existing_url,
+        }, pid)
+        if upload_mid:
+            await crud.update_character(char["id"], media_id=upload_mid)
+            logger.info("%s '%s' upload retry succeeded: media_id=%s", entity_type, char["name"], upload_mid[:30])
+            return {"data": {"media": [{"name": upload_mid}]}}
+        return {"error": f"Upload retry failed for {char['name']} — image exists but cannot get UUID media_id"}
+
+    # ── Normal path: generate image from scratch ──
     # Prefer image_prompt (detailed generation prompt) over description
     prompt = char.get("image_prompt") or f"Character reference: {char['name']}. {char.get('description', '')}"
 
     project = await crud.get_project(pid) if pid != "0" else None
     tier = project.get("user_paygate_tier", "PAYGATE_TIER_TWO") if project else "PAYGATE_TIER_TWO"
-    entity_type = char.get("entity_type", "character")
     aspect = _reference_aspect_ratio(entity_type)
 
     result = await client.generate_images(
@@ -785,9 +808,15 @@ async def _handle_generate_character_image(client, req: dict) -> dict:
         output_url = _extract_output_url(result, "GENERATE_IMAGES")
 
         if output_url:
-            # Step 2: Upload the generated image to get a proper UUID media_id.
-            # batchGenerateImages returns mediaGenerationId (CAMS...) but
-            # imageInputs[].name needs the UUID from uploadImage (media.name).
+            # Try to get UUID directly from generation response (avoids duplicate upload)
+            direct_mid = _extract_media_id(result, "GENERATE_IMAGES")
+            if direct_mid and _is_uuid(direct_mid):
+                await crud.update_character(char["id"], media_id=direct_mid, reference_image_url=output_url)
+                logger.info("%s '%s' ref image ready (no upload needed, %s): media_id=%s",
+                            entity_type, char["name"], aspect.split("_")[-1].lower(), direct_mid)
+                return result
+
+            # UUID not in response — upload to get one (creates duplicate in Google Flow)
             upload_mid = await _upload_character_image(client, {
                 "name": char["name"],
                 "reference_image_url": output_url,
@@ -799,10 +828,9 @@ async def _handle_generate_character_image(client, req: dict) -> dict:
                             entity_type, char["name"], aspect.split("_")[-1].lower(),
                             upload_mid[:30] if upload_mid else "?")
             else:
-                # Upload failed — store ref URL but NOT a bad media_id.
-                # This forces retry on next scene image gen (reference blocking will catch it).
+                # Upload failed — store ref URL for retry on next attempt
                 await crud.update_character(char["id"], reference_image_url=output_url)
-                logger.warning("%s '%s' upload failed, no media_id stored — will retry on next use", entity_type, char["name"])
+                logger.warning("%s '%s' upload failed, no media_id stored — will retry upload on next attempt", entity_type, char["name"])
                 return {"error": f"Upload failed for {char['name']} — image generated but could not get UUID media_id"}
 
     return result
