@@ -98,6 +98,8 @@ function connectToAgent() {
 
       if (msg.method === 'api_request') {
         await handleApiRequest(msg);
+      } else if (msg.method === 'trpc_request') {
+        await handleTrpcRequest(msg);
       } else if (msg.method === 'solve_captcha') {
         await handleSolveCaptcha(msg);
       } else if (msg.method === 'get_status') {
@@ -215,6 +217,30 @@ async function handleSolveCaptcha(msg) {
 
 // ─── API Request Proxy ──────────────────────────────────────
 
+async function handleTrpcRequest(msg) {
+  const { id, params } = msg;
+  const { url, method = 'POST', headers = {}, body } = params;
+
+  if (!url || !url.startsWith('https://labs.google/')) {
+    sendToAgent({ id, error: 'INVALID_TRPC_URL' });
+    return;
+  }
+
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'include',
+    });
+    const data = await resp.json();
+    sendToAgent({ id, status: resp.status, data });
+  } catch (e) {
+    console.error('[FlowAgent] tRPC request failed:', e);
+    sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+  }
+}
+
 async function handleApiRequest(msg) {
   const { id, params } = msg;
   const { url, method, headers, body, captchaAction } = params;
@@ -224,7 +250,8 @@ async function handleApiRequest(msg) {
     return;
   }
 
-  if (!url.startsWith('https://aisandbox-pa.googleapis.com/')) {
+  if (!url.startsWith('https://aisandbox-pa.googleapis.com/') &&
+      !url.startsWith('https://labs.google/')) {
     sendToAgent({ id, error: 'INVALID_URL' });
     return;
   }

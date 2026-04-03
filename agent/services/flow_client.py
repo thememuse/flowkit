@@ -158,7 +158,7 @@ class FlowClient:
         url = "https://labs.google/fx/api/trpc/project.createProject"
         body = {"json": {"projectTitle": project_title, "toolName": tool_name}}
 
-        return await self._send("api_request", {
+        return await self._send("trpc_request", {
             "url": url,
             "method": "POST",
             "headers": {
