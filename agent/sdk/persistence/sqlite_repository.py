@@ -330,6 +330,7 @@ class SQLiteRepository(Repository):
         character_names: Optional[list[str]] = None,
         parent_scene_id: Optional[str] = None,
         chain_type: str = "ROOT",
+        source: str = "root",
     ) -> Scene:
         row = await crud.create_scene(
             video_id=video_id,
@@ -340,6 +341,7 @@ class SQLiteRepository(Repository):
             character_names=character_names,
             parent_scene_id=parent_scene_id,
             chain_type=chain_type,
+            source=source,
         )
         return self._row_to_scene(row)
 

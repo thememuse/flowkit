@@ -21,7 +21,7 @@ class SceneUpdate(BaseModel):
     video_prompt: Optional[str] = None
     character_names: Optional[list[str]] = None
     chain_type: Optional[ChainType] = None
-    source: Optional[str] = None
+    source: Optional[SceneSource] = None
     display_order: Optional[int] = None
 
     vertical_image_url: Optional[str] = None

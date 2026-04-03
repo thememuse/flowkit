@@ -184,16 +184,17 @@ async def list_videos(project_id: str) -> list[dict]:
 async def create_scene(video_id: str, display_order: int, prompt: str,
                        image_prompt: str = None, video_prompt: str = None,
                        character_names: list[str] = None,
-                       parent_scene_id: str = None, chain_type: str = "ROOT") -> dict:
+                       parent_scene_id: str = None, chain_type: str = "ROOT",
+                       source: str = "root") -> dict:
     db = await get_db()
     sid, now = _uuid(), _now()
     chars_json = json.dumps(character_names) if character_names else None
     async with _db_lock:
         await db.execute(
             """INSERT INTO scene (id,video_id,display_order,prompt,image_prompt,video_prompt,character_names,
-               parent_scene_id,chain_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               parent_scene_id,chain_type,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sid, video_id, display_order, prompt, image_prompt, video_prompt, chars_json,
-             parent_scene_id, chain_type, now, now))
+             parent_scene_id, chain_type, source, now, now))
         await db.commit()
     return await _get_with_db(db, "scene", "id", sid)
 

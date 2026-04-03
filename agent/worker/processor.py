@@ -52,6 +52,9 @@ async def process_pending_requests():
                 if rid not in active and len(active) < MAX_CONCURRENT_REQUESTS:
                     active.add(rid)
                     asyncio.create_task(_tracked(req, active, deferred))
+            # Prune stale deferred entries for requests no longer pending
+            pending_ids = {r["id"] for r in pending}
+            deferred = {k: v for k, v in deferred.items() if k in pending_ids}
         except Exception as e:
             logger.exception("Worker loop error: %s", e)
         await asyncio.sleep(POLL_INTERVAL)
