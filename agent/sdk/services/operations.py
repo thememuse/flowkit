@@ -572,7 +572,9 @@ async def _build_video_prompt(base_prompt: str, scene: dict, project_id: str | N
     """Enhance video prompt with character voice context and audio instructions."""
     parts = [base_prompt.strip()]
 
-    if project_id:
+    # Only append voice context when video_prompt contains dialogue (quoted speech)
+    has_dialogue = '"' in base_prompt or "says" in base_prompt.lower() or "whispers" in base_prompt.lower() or "shouts" in base_prompt.lower() or "asks" in base_prompt.lower() or "replies" in base_prompt.lower()
+    if project_id and has_dialogue:
         char_names_raw = scene.get("character_names")
         if isinstance(char_names_raw, str):
             try:
