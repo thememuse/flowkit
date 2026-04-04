@@ -1,6 +1,6 @@
 Show full status dashboard for a project.
 
-Usage: `/status <project_id>` or `/status` (lists all projects)
+Usage: `/gla:status <project_id>` or `/gla:status` (lists all projects)
 
 ## If no project_id: list all projects
 
@@ -61,3 +61,13 @@ Suggest next action:
 - If images missing → "Run /gla:gen-images <PID> <VID>"
 - If videos missing → "Run /gla:gen-videos <PID> <VID>"
 - If all done → "Run /gla:concat <VID>"
+
+## Statusline Integration
+
+The `/gla:status` output is available in Claude Code's statusline at the bottom, showing live project progress:
+
+```
+GLA: ✓ext Operation Hormu 40sc img:40 vid:40 4K:26 ▶0/5
+```
+
+**Note:** Default orientation for TTS narration is **HORIZONTAL** (landscape, 16:9). For VERTICAL (portrait, 9:16) projects, explicitly pass `orientation: "VERTICAL"` to `/gla:gen-tts`.

@@ -15,7 +15,7 @@ let state = 'off'; // off | idle | running
 let manualDisconnect = false;
 let metrics = {
   tokenCapturedAt: null,
-  requestCount: 0,
+  requestCount: 0,   // captcha-consuming requests only (gen image/video/upscale)
   successCount: 0,
   failedCount: 0,
   lastError: null,
@@ -23,15 +23,17 @@ let metrics = {
 
 // ─── URL → Log Type Classifier ─────────────────────────────
 
+// Visible log types — only these appear in the request log
+const _VISIBLE_TYPES = new Set(['GEN_IMG', 'GEN_VID', 'GEN_VID_REF', 'UPSCALE', 'TRACKING', 'URL_REFRESH']);
+
 function _classifyApiUrl(url) {
-  if (url.includes('/uploadImage'))                    return 'UPLOAD';
-  if (url.includes('/batchGenerateImages'))             return 'GEN_IMG';
-  if (url.includes('/batchAsyncGenerateVideoStartImage'))    return 'GEN_VID';
-  if (url.includes('/batchAsyncGenerateVideoStartAndEnd'))   return 'GEN_VID';
-  if (url.includes('/batchAsyncGenerateVideoReferenceImages')) return 'GEN_VID_REF';
-  if (url.includes('/batchAsyncGenerateVideoUpsampleVideo'))  return 'UPSCALE';
-  if (url.includes('/batchCheckAsyncVideoGenerationStatus'))  return 'POLL';
-  if (url.includes('/upsampleImage'))                  return 'UPS_IMG';
+  if (url.includes('uploadImage'))                     return 'UPLOAD';
+  if (url.includes('batchGenerateImages'))              return 'GEN_IMG';
+  if (url.includes('UpsampleVideo'))                   return 'UPSCALE';
+  if (url.includes('ReferenceImages'))                 return 'GEN_VID_REF';
+  if (url.includes('batchAsyncGenerateVideo'))          return 'GEN_VID';
+  if (url.includes('batchCheckAsync'))                  return 'POLL';
+  if (url.includes('upsampleImage'))                   return 'UPS_IMG';
   if (url.includes('/media/'))                         return 'MEDIA';
   if (url.includes('/credits'))                        return 'CREDITS';
   return 'API';
@@ -316,6 +318,8 @@ async function handleSolveCaptcha(msg) {
   const { id, params } = msg;
   const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
 
+  // Standalone captcha solve counts as captcha-consuming
+  metrics.requestCount++;
   if (result?.token) {
     metrics.successCount++;
   } else {
@@ -339,11 +343,11 @@ async function handleTrpcRequest(msg) {
   }
 
   setState('running');
-  metrics.requestCount++;
+  // TRPC calls don't consume captcha — don't count in metrics
 
   const logId = id;
   const logType = url.includes('createProject') ? 'CREATE_PROJECT' : 'TRPC';
-  addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null });
+  // TRPC calls are silent — don't show in request log
 
   const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
   if (flowKey) {
@@ -358,14 +362,11 @@ async function handleTrpcRequest(msg) {
       credentials: 'include',
     });
     const data = await resp.json();
-    metrics.successCount++;
     chrome.storage.local.set({ metrics });
     updateRequestLog(logId, { status: 'success' });
     sendToAgent({ id, status: resp.status, data });
   } catch (e) {
     console.error('[FlowAgent] tRPC request failed:', e);
-    metrics.failedCount++;
-    metrics.lastError = e.message || 'TRPC_FETCH_FAILED';
     chrome.storage.local.set({ metrics });
     updateRequestLog(logId, { status: 'failed', error: e.message || 'TRPC_FETCH_FAILED' });
     sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
@@ -389,11 +390,14 @@ async function handleApiRequest(msg) {
   }
 
   setState('running');
-  metrics.requestCount++;
+  const hasCaptcha = !!captchaAction;
+  if (hasCaptcha) metrics.requestCount++;
 
   const logId = id;
   const logType = _classifyApiUrl(url);
-  addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null });
+  if (_VISIBLE_TYPES.has(logType)) {
+    addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null });
+  }
 
   try {
     // Step 1: Solve captcha if needed
@@ -406,8 +410,7 @@ async function handleApiRequest(msg) {
         const err = captchaResult?.error || 'CAPTCHA_FAILED';
         console.error(`[FlowAgent] Captcha failed for ${captchaAction}: ${err}`);
         sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
-        metrics.failedCount++;
-        metrics.lastError = `CAPTCHA_FAILED: ${err}`;
+        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
         chrome.storage.local.set({ metrics });
         updateRequestLog(logId, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
         setState('idle');
@@ -435,8 +438,7 @@ async function handleApiRequest(msg) {
     const activeFlowKey = flowKey;
     if (!activeFlowKey) {
       sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
-      metrics.failedCount++;
-      metrics.lastError = 'NO_FLOW_KEY';
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
       chrome.storage.local.set({ metrics });
       updateRequestLog(logId, { status: 'failed', error: 'NO_FLOW_KEY' });
       setState('idle');
@@ -469,12 +471,10 @@ async function handleApiRequest(msg) {
     });
 
     if (response.ok) {
-      metrics.successCount++;
-      metrics.lastError = null;
+      if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
       updateRequestLog(logId, { status: 'success' });
     } else {
-      metrics.failedCount++;
-      metrics.lastError = `API_${response.status}`;
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${response.status}`; }
       updateRequestLog(logId, { status: 'failed', error: `API_${response.status}` });
     }
   } catch (e) {
@@ -483,8 +483,7 @@ async function handleApiRequest(msg) {
       status: 500,
       error: e.message || 'API_REQUEST_FAILED',
     });
-    metrics.failedCount++;
-    metrics.lastError = e.message;
+    if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message; }
     updateRequestLog(logId, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
   }
 
@@ -609,13 +608,7 @@ function handleTrpcMediaUrls(trpcUrl, bodyText) {
     if (!entries.length) return;
 
     console.log(`[FlowAgent] Captured ${entries.length} fresh media URLs from TRPC`);
-    addRequestLog({
-      id: `trpc-urls-${Date.now()}`,
-      type: 'URL_REFRESH',
-      time: new Date().toISOString(),
-      status: 'success',
-      error: null,
-    });
+    // URL refresh is silent — don't show in request log
 
     // Forward to agent for DB update
     if (ws?.readyState === WebSocket.OPEN) {
@@ -702,11 +695,8 @@ async function sendTelemetry() {
     'authorization': `Bearer ${flowKey}`,
   };
 
-  const logId = `telemetry-${Date.now()}`;
-  addRequestLog({ id: logId, type: 'TRACKING', time: new Date().toISOString(), status: 'processing', error: null });
-
+  // Telemetry is silent — don't show in request log
   try {
-    // Pick one of the two endpoints randomly
     if (Math.random() < 0.5) {
       await fetch(`https://aisandbox-pa.googleapis.com/v1:batchLog`, {
         method: 'POST', headers, credentials: 'include',
@@ -718,10 +708,7 @@ async function sendTelemetry() {
         body: JSON.stringify(_buildFrontendEventsPayload()),
       });
     }
-    updateRequestLog(logId, { status: 'success' });
-  } catch {
-    updateRequestLog(logId, { status: 'failed', error: 'TELEMETRY_FAILED' });
-  }
+  } catch {}
 }
 
 // Send telemetry at random intervals (45-120s) to look organic

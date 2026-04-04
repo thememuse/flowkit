@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Google Flow Agent + OMC combined statusline for Claude Code
+# Google Flow Agent statusline for Claude Code
+# Claude Code pipes session JSON to stdin — read it for real-time stats
 # ANSI colors: green=32, violet/magenta=35
 
 G="\033[32m"  # green
 V="\033[35m"  # violet
 R="\033[0m"   # reset
 
-# ── OMC info (from hud-stdin-cache.json) ──
-OMC=""
-HUD_CACHE=".omc/state/hud-stdin-cache.json"
-if [ -f "$HUD_CACHE" ]; then
-  model=$(jq -r '.model.display_name // empty' "$HUD_CACHE" 2>/dev/null)
-  ctx_pct=$(jq -r '.context_window.used_percentage // 0' "$HUD_CACHE" 2>/dev/null)
-  rl5h=$(jq -r '.rate_limits.five_hour.used_percentage // 0' "$HUD_CACHE" 2>/dev/null)
-  rl7d=$(jq -r '.rate_limits.seven_day.used_percentage // 0' "$HUD_CACHE" 2>/dev/null)
+# ── Claude session info (from stdin JSON) ──
+CLAUDE=""
+STDIN_JSON=""
+
+# Read stdin if available (Claude Code pipes session state)
+if [ ! -t 0 ]; then
+  STDIN_JSON=$(cat)
+fi
+
+if [ -n "$STDIN_JSON" ]; then
+  model=$(echo "$STDIN_JSON" | jq -r '.model.display_name // empty' 2>/dev/null)
+  ctx_pct=$(echo "$STDIN_JSON" | jq -r '.context_window.used_percentage // 0' 2>/dev/null | awk '{printf "%d", $1}')
+  rl5h=$(echo "$STDIN_JSON" | jq -r '.rate_limits.five_hour.used_percentage // 0' 2>/dev/null | awk '{printf "%d", $1}')
+  rl7d=$(echo "$STDIN_JSON" | jq -r '.rate_limits.seven_day.used_percentage // 0' 2>/dev/null | awk '{printf "%d", $1}')
   if [ -n "$model" ]; then
-    OMC="${model} ctx:${G}${ctx_pct}%${R} rl:${G}${rl5h}%${R}/5h ${G}${rl7d}%${R}/7d"
+    CLAUDE="${model} ctx:${G}${ctx_pct}%${R} rl:${G}${rl5h}%${R}/5h ${G}${rl7d}%${R}/7d"
   fi
 fi
 
@@ -24,7 +31,7 @@ BASE="http://127.0.0.1:8100"
 health=$(curl -s --max-time 1 "$BASE/health" 2>/dev/null)
 
 if [ -z "$health" ]; then
-  echo -e "${OMC:+$OMC | }GLA: ⚠ DOWN"
+  echo -e "${CLAUDE:+$CLAUDE | }GLA: ⚠ DOWN"
   exit 0
 fi
 
@@ -54,7 +61,7 @@ fi
 # Most recent project
 project=$(curl -s --max-time 1 "$BASE/api/projects" 2>/dev/null)
 if [ -z "$project" ] || [ "$project" = "[]" ]; then
-  echo -e "${OMC:+$OMC | }GLA: ${ext_icon}"
+  echo -e "${CLAUDE:+$CLAUDE | }GLA: ${ext_icon}"
   exit 0
 fi
 
@@ -66,7 +73,7 @@ video=$(curl -s --max-time 1 "$BASE/api/videos?project_id=$proj_id" 2>/dev/null)
 vid_id=$(echo "$video" | jq -r '.[-1].id // ""' 2>/dev/null)
 
 if [ -z "$vid_id" ] || [ "$vid_id" = "" ]; then
-  echo -e "${OMC:+$OMC | }GLA: ${ext_icon} $(echo "$proj_name" | cut -c1-15)"
+  echo -e "${CLAUDE:+$CLAUDE | }GLA: ${ext_icon} $(echo "$proj_name" | cut -c1-15)"
   exit 0
 fi
 
@@ -85,6 +92,7 @@ if [ "$img_done" = "0" ] && [ "$vid_done" = "0" ]; then
   up_done=$(echo "$scenes" | jq '[.[] | select(.vertical_upscale_status == "COMPLETED")] | length' 2>/dev/null || echo 0)
 fi
 
+pending=$(curl -s --max-time 1 "$BASE/api/requests/pending" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
 processing=$(curl -s --max-time 1 "$BASE/api/requests?status=PROCESSING" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
 
 short_name=$(echo "$proj_name" | cut -c1-15)
@@ -93,4 +101,7 @@ flow_str=""
 [ -n "$credits_info" ] && flow_str=" ${V}${credits_info}${R}"
 [ -n "$flow_info" ] && flow_str="${flow_str} ${V}${flow_info}${R}"
 
-echo -e "${OMC:+$OMC | }GLA: ${ext_icon}${flow_str} ${short_name} ${total}sc img:${V}${img_done}${R} vid:${V}${vid_done}${R} 4K:${V}${up_done}${R} ▶${V}${processing}${R}/5"
+# Queue: pending→processing/max
+queue="${V}${pending}${R}→${V}${processing}${R}/5"
+
+echo -e "${CLAUDE:+$CLAUDE | }GLA: ${ext_icon}${flow_str} ${short_name} ${total}sc img:${V}${img_done}${R} vid:${V}${vid_done}${R} 4K:${V}${up_done}${R} Q:${queue}"
