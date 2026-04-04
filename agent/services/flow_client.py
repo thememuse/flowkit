@@ -65,6 +65,10 @@ class FlowClient:
             asyncio.create_task(self._sync_tier())
             return
 
+        if data.get("type") == "media_urls_refresh":
+            asyncio.create_task(self._refresh_media_urls(data.get("urls", [])))
+            return
+
         if data.get("type") == "pong":
             return
 
@@ -103,6 +107,116 @@ class FlowClient:
             logger.warning("Failed to sync tier: %s", e)
         finally:
             self._sync_in_progress = False
+
+    _UUID_RE = __import__("re").compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+    _SAFE_URL_RE = __import__("re").compile(r'^https://(storage\.googleapis\.com|lh3\.googleusercontent\.com)/')
+
+    async def _refresh_media_urls(self, urls: list[dict]):
+        """Update scene/character URLs in DB from fresh TRPC-captured signed URLs.
+
+        Each entry: {mediaId: str, mediaType: 'image'|'video', url: str}
+        """
+        from agent.db import crud
+        from agent.services.event_bus import event_bus
+
+        updated = 0
+        for entry in urls:
+            media_id = entry.get("mediaId", "")
+            media_type = entry.get("mediaType", "")
+            url = entry.get("url", "")
+            if not media_id or not url:
+                continue
+            # Validate media_id is UUID and url is from trusted domains
+            if not self._UUID_RE.match(media_id):
+                logger.warning("Rejected invalid media_id: %s", media_id[:20])
+                continue
+            if not self._SAFE_URL_RE.match(url):
+                logger.warning("Rejected untrusted URL domain for media %s", media_id[:12])
+                continue
+            if media_type not in ("image", "video"):
+                continue
+
+            # Try matching against scenes (check both orientations)
+            scenes = await crud.list_scenes_by_media_id(media_id)
+            for scene in scenes:
+                updates = {}
+                if media_type == "image":
+                    # Update whichever orientation matches
+                    if scene.get("vertical_image_media_id") == media_id:
+                        updates["vertical_image_url"] = url
+                    if scene.get("horizontal_image_media_id") == media_id:
+                        updates["horizontal_image_url"] = url
+                elif media_type == "video":
+                    if scene.get("vertical_video_media_id") == media_id:
+                        updates["vertical_video_url"] = url
+                    if scene.get("horizontal_video_media_id") == media_id:
+                        updates["horizontal_video_url"] = url
+                    if scene.get("vertical_upscale_media_id") == media_id:
+                        updates["vertical_upscale_url"] = url
+                    if scene.get("horizontal_upscale_media_id") == media_id:
+                        updates["horizontal_upscale_url"] = url
+                if updates:
+                    await crud.update_scene(scene["id"], **updates)
+                    updated += 1
+
+            # Try matching against characters
+            chars = await crud.list_characters_by_media_id(media_id)
+            for char in chars:
+                if media_type == "image" and char.get("media_id") == media_id:
+                    await crud.update_character(char["id"], reference_image_url=url)
+                    updated += 1
+
+        if updated:
+            logger.info("Refreshed %d media URLs from TRPC intercept", updated)
+            await event_bus.emit("urls_refreshed", {"count": updated})
+
+    async def refresh_project_urls(self, project_id: str) -> dict:
+        """Call Google Flow TRPC to get fresh signed URLs for all media in a project.
+
+        Tries flow.getFlow TRPC endpoint, extracts all GCS signed URLs,
+        and updates scenes/characters in DB.
+        """
+        import re
+        from agent.db import crud
+        from agent.services.event_bus import event_bus
+
+        # Try TRPC getFlow
+        trpc_url = f"https://labs.google/fx/api/trpc/flow.getFlow?input=%7B%22json%22%3A%7B%22projectId%22%3A%22{project_id}%22%7D%7D"
+        result = await self._send("trpc_request", {
+            "url": trpc_url,
+            "method": "GET",
+        }, timeout=30)
+
+        if result.get("error"):
+            logger.warning("TRPC getFlow failed: %s", result.get("error"))
+            return {"error": result.get("error")}
+
+        # Extract body text
+        data = result.get("data", result)
+        body_text = json.dumps(data) if isinstance(data, (dict, list)) else str(data)
+
+        # Extract all GCS signed URLs
+        url_regex = r'https://storage\.googleapis\.com/ai-sandbox-videofx/(?:image|video)/[0-9a-f-]{36}\?[^"\'\\}\s]+'
+        raw_matches = re.findall(url_regex, body_text)
+
+        # Deduplicate by media_id
+        url_map = {}
+        for raw_url in raw_matches:
+            clean = raw_url.replace('\\u0026', '&').replace('\\/', '/').rstrip(',])}')
+            m = re.search(r'/(image|video)/([0-9a-f-]{36})\?', clean)
+            if m:
+                media_type, media_id = m.group(1), m.group(2)
+                url_map[media_id] = {"mediaId": media_id, "mediaType": media_type, "url": clean}
+
+        if not url_map:
+            logger.warning("No media URLs found in TRPC response")
+            return {"refreshed": 0, "found": 0}
+
+        # Update DB
+        await self._refresh_media_urls(list(url_map.values()))
+
+        logger.info("Bulk refresh: found %d unique media URLs for project %s", len(url_map), project_id[:12])
+        return {"refreshed": len(url_map), "found": len(raw_matches)}
 
     async def _send(self, method: str, params: dict, timeout: float = 300) -> dict:
         """Send request to extension and wait for response.

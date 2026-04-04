@@ -6,7 +6,7 @@ import signal
 from contextlib import asynccontextmanager
 
 import websockets
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent.config import API_HOST, API_PORT, WS_HOST, WS_PORT
@@ -22,6 +22,7 @@ from agent.api.tts import router as tts_router
 from agent.api.materials import router as materials_router
 from agent.worker.processor import get_worker_controller
 from agent.services.flow_client import get_flow_client
+from agent.services.event_bus import event_bus
 from agent.sdk import init_sdk
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -132,6 +133,64 @@ async def health():
     }
 
 
+# ─── Dashboard WebSocket ──────────────────────────────────────
+
+@app.websocket("/ws/dashboard")
+async def dashboard_ws(websocket: WebSocket):
+    """WebSocket endpoint for dashboard clients (Chrome extension side panel)."""
+    # Reject cross-origin connections (only allow localhost)
+    origin = (websocket.headers.get("origin") or "").lower()
+    if origin and not any(origin.startswith(p) for p in (
+        "http://127.0.0.1", "http://localhost", "chrome-extension://",
+    )):
+        await websocket.close(code=4003, reason="Origin not allowed")
+        return
+    await websocket.accept()
+
+    q = event_bus.subscribe()
+    try:
+        # Send initial snapshot
+        client = get_flow_client()
+        controller = get_worker_controller()
+        from agent.db import crud
+        pending_requests = await crud.list_requests(status="PENDING")
+        processing_requests = await crud.list_requests(status="PROCESSING")
+        snapshot = {
+            "type": "snapshot",
+            "health": {
+                "status": "ok",
+                "extension_connected": client.connected,
+            },
+            "requests": pending_requests + processing_requests,
+            "worker": {
+                "active": controller.active_count,
+                "slots": max(0, 5 - controller.active_count),
+            },
+        }
+        await websocket.send_text(json.dumps(snapshot))
+
+        # Forward events from event_bus to this client
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=30.0)
+                await websocket.send_text(msg)
+            except asyncio.TimeoutError:
+                # Send keepalive ping
+                await websocket.send_text(json.dumps({"type": "ping"}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug("Dashboard WS client disconnected: %s", e)
+    finally:
+        event_bus.unsubscribe(q)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("agent.main:app", host=API_HOST, port=API_PORT, reload=True)
+    uvicorn.run(
+        "agent.main:app",
+        host=API_HOST,
+        port=API_PORT,
+        reload=True,
+        reload_excludes=["*.db", "*.db-wal", "*.db-shm", "output/*"],
+    )

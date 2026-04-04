@@ -89,8 +89,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     if (!value.startsWith('Bearer ya29.')) return;
 
     const token = value.replace(/^Bearer\s+/i, '').trim();
-    if (!token || token === flowKey) return;
+    if (!token) return;
 
+    // Always update — even if same token string, refresh the timestamp
     flowKey = token;
     metrics.tokenCapturedAt = Date.now();
     chrome.storage.local.set({ flowKey, metrics });
@@ -101,16 +102,43 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
     }
   },
-  { urls: ['https://aisandbox-pa.googleapis.com/*'] },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
   ['requestHeaders', 'extraHeaders'],
 );
+
+let _openingFlowTab = false;
 
 async function captureTokenFromFlowTab() {
   const tabs = await chrome.tabs.query({
     url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
   });
   if (!tabs.length) {
-    console.log('[FlowAgent] No Flow tab found for token refresh');
+    if (_openingFlowTab) {
+      console.log('[FlowAgent] Flow tab already opening, skipping');
+      return;
+    }
+    _openingFlowTab = true;
+    try {
+      console.log('[FlowAgent] No Flow tab found — opening one in background');
+      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
+      await sleep(3000);
+      const retryTabs = await chrome.tabs.query({
+        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+      });
+      if (!retryTabs.length) {
+        console.log('[FlowAgent] Flow tab not ready yet after open');
+        return;
+      }
+      await chrome.scripting.executeScript({
+        target: { tabId: retryTabs[0].id },
+        files: ['content.js'],
+      });
+      console.log('[FlowAgent] Token refresh triggered on newly opened Flow tab');
+    } catch (e) {
+      console.error('[FlowAgent] Token refresh failed after opening tab:', e);
+    } finally {
+      _openingFlowTab = false;
+    }
     return;
   }
   try {
@@ -144,15 +172,18 @@ function connectToAgent() {
     chrome.alarms.clear('reconnect');
     setState('idle');
 
-    // Hourly token refresh alarm
-    chrome.alarms.create('token-refresh', { periodInMinutes: 60 });
+    // Token refresh alarm — 45 min gives buffer before ~60 min expiry
+    chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
 
-    // Send current state
+    // Send current state + resend token if we have one
     ws.send(JSON.stringify({
       type: 'extension_ready',
       flowKeyPresent: !!flowKey,
       tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
     }));
+    if (flowKey) {
+      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+    }
   };
 
   ws.onmessage = async ({ data }) => {
@@ -361,7 +392,7 @@ async function handleApiRequest(msg) {
   metrics.requestCount++;
 
   const logId = id;
-  const logType = captchaAction || _classifyApiUrl(url);
+  const logType = _classifyApiUrl(url);
   addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null });
 
   try {
@@ -543,11 +574,168 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     return true;
   }
 
+  if (msg.type === 'TRPC_MEDIA_URLS') {
+    handleTrpcMediaUrls(msg.trpcUrl, msg.body);
+    reply({ ok: true });
+    return true;
+  }
+
   return true;
 });
+
+// ─── TRPC Media URL Extractor ──────────────────────────────
+
+function handleTrpcMediaUrls(trpcUrl, bodyText) {
+  try {
+    // Extract all fresh GCS signed URLs
+    const urlRegex = /https:\/\/storage\.googleapis\.com\/ai-sandbox-videofx\/(?:image|video)\/[0-9a-f-]{36}\?[^"'\s]+/g;
+    const matches = bodyText.match(urlRegex) || [];
+    if (!matches.length) return;
+
+    // Deduplicate and parse
+    const urlMap = {};
+    for (const rawUrl of matches) {
+      // Unescape JSON-escaped URLs
+      const url = rawUrl.replace(/\\u0026/g, '&').replace(/\\/g, '');
+      const mediaMatch = url.match(/\/(image|video)\/([0-9a-f-]{36})\?/);
+      if (mediaMatch) {
+        const [, mediaType, mediaId] = mediaMatch;
+        // Keep last occurrence (freshest)
+        urlMap[mediaId] = { mediaType, url, mediaId };
+      }
+    }
+
+    const entries = Object.values(urlMap);
+    if (!entries.length) return;
+
+    console.log(`[FlowAgent] Captured ${entries.length} fresh media URLs from TRPC`);
+    addRequestLog({
+      id: `trpc-urls-${Date.now()}`,
+      type: 'URL_REFRESH',
+      time: new Date().toISOString(),
+      status: 'success',
+      error: null,
+    });
+
+    // Forward to agent for DB update
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'media_urls_refresh',
+        urls: entries,
+      }));
+    }
+  } catch (e) {
+    console.error('[FlowAgent] Failed to extract TRPC media URLs:', e);
+  }
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+// ─── Human-like Telemetry ──────────────────────────────────
+// Periodically send tracking events to Google's analytics endpoints
+// to mimic normal browser behavior.
+
+const _UA = navigator.userAgent;
+let _telemetrySessionId = `;${Date.now()}`;
+
+function _rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+function _buildBatchLogPayload() {
+  const events = [];
+  const types = ['FLOW_IMAGE_LATENCY', 'FLOW_VIDEO_LATENCY'];
+  const count = _rand(1, 3);
+  for (let i = 0; i < count; i++) {
+    events.push({
+      event: types[_rand(0, types.length - 1)],
+      eventProperties: [
+        { key: 'CURRENT_TIME_MS', doubleValue: Date.now() },
+        { key: 'DURATION_MS', doubleValue: _rand(150, 800) },
+        { key: 'USER_AGENT', stringValue: _UA },
+        { key: 'IS_DESKTOP', booleanValue: true },
+      ],
+      eventMetadata: { sessionId: _telemetrySessionId },
+      eventTime: new Date().toISOString(),
+    });
+  }
+  return { appEvents: events };
+}
+
+function _buildFrontendEventsPayload() {
+  const eventTypes = [
+    'FLOW_IMAGE_LATENCY', 'FLOW_VIDEO_LATENCY', 'GRID_SCROLL_DEPTH',
+    'FLOW_PROJECT_OPEN', 'FLOW_SCENE_VIEW',
+  ];
+  const count = _rand(1, 4);
+  const events = [];
+  for (let i = 0; i < count; i++) {
+    const et = eventTypes[_rand(0, eventTypes.length - 1)];
+    const params = {
+      USER_AGENT: { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: _UA },
+      IS_DESKTOP: { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: 'true' },
+    };
+    if (et.includes('LATENCY')) {
+      params.CURRENT_TIME_MS = { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: String(Date.now()) };
+      params.DURATION_MS = { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: String(_rand(100, 600)) };
+    }
+    if (et === 'GRID_SCROLL_DEPTH') {
+      params.MEDIA_GENERATION_PAYGATE_TIER = { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: 'PAYGATE_TIER_TWO' };
+    }
+    events.push({
+      eventType: et,
+      metadata: {
+        sessionId: _telemetrySessionId,
+        createTime: new Date().toISOString(),
+        additionalParams: params,
+      },
+    });
+  }
+  return { events };
+}
+
+async function sendTelemetry() {
+  if (!flowKey || state === 'off') return;
+
+  const headers = {
+    'Content-Type': 'text/plain;charset=UTF-8',
+    'authorization': `Bearer ${flowKey}`,
+  };
+
+  const logId = `telemetry-${Date.now()}`;
+  addRequestLog({ id: logId, type: 'TRACKING', time: new Date().toISOString(), status: 'processing', error: null });
+
+  try {
+    // Pick one of the two endpoints randomly
+    if (Math.random() < 0.5) {
+      await fetch(`https://aisandbox-pa.googleapis.com/v1:batchLog`, {
+        method: 'POST', headers, credentials: 'include',
+        body: JSON.stringify(_buildBatchLogPayload()),
+      });
+    } else {
+      await fetch(`https://aisandbox-pa.googleapis.com/v1/flow:batchLogFrontendEvents`, {
+        method: 'POST', headers, credentials: 'include',
+        body: JSON.stringify(_buildFrontendEventsPayload()),
+      });
+    }
+    updateRequestLog(logId, { status: 'success' });
+  } catch {
+    updateRequestLog(logId, { status: 'failed', error: 'TELEMETRY_FAILED' });
+  }
+}
+
+// Send telemetry at random intervals (45-120s) to look organic
+function scheduleTelemetry() {
+  const delay = _rand(45, 120) * 1000;
+  setTimeout(async () => {
+    await sendTelemetry();
+    scheduleTelemetry(); // reschedule with new random interval
+  }, delay);
+}
+
+// Refresh session ID every ~30min like a real user
+setInterval(() => { _telemetrySessionId = `;${Date.now()}`; }, _rand(25, 35) * 60 * 1000);
+
+scheduleTelemetry();
 
 console.log('[FlowAgent] Extension loaded');

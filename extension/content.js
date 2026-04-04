@@ -35,3 +35,15 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   return true; // keep channel open for async reply
 });
+
+// ─── TRPC Media URL Monitor ─────────────────────────────────
+// Forward intercepted TRPC responses with media URLs to background.js
+window.addEventListener('TRPC_MEDIA_URLS', (e) => {
+  const { url, body } = e.detail || {};
+  if (!body) return;
+  chrome.runtime.sendMessage({
+    type: 'TRPC_MEDIA_URLS',
+    trpcUrl: url,
+    body,
+  }).catch(() => {});
+});

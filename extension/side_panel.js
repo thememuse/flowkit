@@ -30,6 +30,8 @@ const TYPE_LABELS = {
   CREATE_PROJECT:           'CREATE PROJECT',
   UPLOAD:                   'UPLOAD IMAGE',
   MEDIA:                    'READ MEDIA',
+  TRACKING:                 'GOOGLE FLOW TRACK',
+  URL_REFRESH:              'URL REFRESH',
   TRPC:                     'TRPC',
   API:                      'API',
 };
@@ -80,9 +82,19 @@ function updateStatus(data) {
   // Token status
   const tokenEl = document.getElementById('token-status');
   if (data.flowKeyPresent) {
-    const age = data.tokenAge ? `${Math.round(data.tokenAge / 60000)}m ago` : 'fresh';
-    tokenEl.textContent = `token ${age}`;
-    tokenEl.className = 'ok';
+    const ageMs = data.tokenAge || 0;
+    const ageMin = Math.round(ageMs / 60000);
+    if (ageMs > 3600000) {
+      tokenEl.textContent = `token expired — open Flow to refresh`;
+      tokenEl.className = 'warn';
+    } else {
+      tokenEl.textContent = `token synced ${ageMin}m`;
+      tokenEl.className = 'ok';
+    }
+    // Auto-refresh when token age > 55 min and connected
+    if (ageMs > 3300000 && data.agentConnected) {
+      chrome.runtime.sendMessage({ type: 'REFRESH_TOKEN' });
+    }
   } else {
     tokenEl.textContent = 'no token';
     tokenEl.className = 'bad';

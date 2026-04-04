@@ -99,6 +99,50 @@ python3 -c "from agent.main import app; print('  OK: agent.main imports successf
     exit 1
 }
 
+# ─── jq (for statusline) ───────────────────────────────────
+echo "Checking jq..."
+if command -v jq &>/dev/null; then
+    echo "  OK: jq $(jq --version 2>&1)"
+else
+    echo "  WARNING: jq not found (needed for statusline)"
+    echo "  macOS:   brew install jq"
+    echo "  Ubuntu:  sudo apt install jq"
+fi
+
+# ─── Claude Code statusline ────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+STATUSLINE_SCRIPT="$SCRIPT_DIR/scripts/statusline.sh"
+CLAUDE_SETTINGS="$SCRIPT_DIR/.claude/settings.local.json"
+
+echo "Setting up Claude Code statusline..."
+chmod +x "$STATUSLINE_SCRIPT" 2>/dev/null
+
+if ! command -v jq &>/dev/null; then
+    echo "  SKIPPED: jq not installed (needed for statusline setup)"
+elif [ -f "$CLAUDE_SETTINGS" ]; then
+    # Check if statusLine already configured
+    if jq -e '.statusLine' "$CLAUDE_SETTINGS" &>/dev/null; then
+        echo "  OK: statusLine already configured"
+    else
+        # Add statusLine to existing settings
+        TMP=$(mktemp)
+        jq --arg cmd "$STATUSLINE_SCRIPT" '. + {"statusLine": {"type": "command", "command": $cmd}}' "$CLAUDE_SETTINGS" > "$TMP" && mv "$TMP" "$CLAUDE_SETTINGS"
+        echo "  Added: statusLine to .claude/settings.local.json"
+    fi
+else
+    # Create settings file with statusLine
+    mkdir -p "$SCRIPT_DIR/.claude"
+    cat > "$CLAUDE_SETTINGS" <<EOJSON
+{
+  "statusLine": {
+    "type": "command",
+    "command": "$STATUSLINE_SCRIPT"
+  }
+}
+EOJSON
+    echo "  Created: .claude/settings.local.json with statusLine"
+fi
+
 echo ""
 echo "========================================="
 echo "  Setup complete!"
@@ -118,4 +162,7 @@ echo "     python -m agent.main"
 echo ""
 echo "  4. Verify:"
 echo "     curl http://127.0.0.1:8100/health"
+echo ""
+echo "  5. Claude Code statusline:"
+echo "     GLA status shows at the bottom of Claude Code automatically."
 echo ""

@@ -135,6 +135,22 @@ async def check_status(body: CheckStatusRequest):
     return result.get("data", result)
 
 
+@router.post("/refresh-urls/{project_id}")
+async def refresh_project_urls(project_id: str):
+    """Bulk refresh all media URLs for a project via TRPC.
+
+    Calls Google Flow's TRPC API to get fresh signed URLs,
+    then updates all scenes/characters in DB.
+    """
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+    result = await client.refresh_project_urls(project_id)
+    if result.get("error"):
+        raise HTTPException(502, result["error"])
+    return result
+
+
 @router.get("/media/{media_id}")
 async def get_media(media_id: str):
     """Get media metadata + fresh signed URL from Google Flow.

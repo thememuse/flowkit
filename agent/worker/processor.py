@@ -13,6 +13,7 @@ import aiohttp
 
 from agent.db import crud
 from agent.services.flow_client import get_flow_client
+from agent.services.event_bus import event_bus
 from agent.config import POLL_INTERVAL, MAX_RETRIES, API_COOLDOWN, MAX_CONCURRENT_REQUESTS
 from agent.worker._parsing import _is_error
 from agent.sdk.services.result_handler import parse_result, apply_scene_result, apply_character_result
@@ -62,6 +63,11 @@ class WorkerController:
         self._deferred: dict[str, float] = {}  # rid -> defer_until timestamp
         self._retry_after: dict[str, float] = {}  # rid -> retry_after timestamp
 
+    @property
+    def active_count(self) -> int:
+        """Number of currently active requests."""
+        return len(self._active_ids)
+
     async def start(self):
         """Start the worker loop."""
         await self._cleanup_stale_processing()
@@ -110,6 +116,13 @@ class WorkerController:
                 pending = await crud.list_actionable_requests(
                     exclude_ids=self._active_ids, limit=slots_available
                 )
+
+                pending_count = len(pending)
+                await event_bus.emit("worker_tick", {
+                    "active": len(self._active_ids),
+                    "slots": slots_available,
+                    "pending": pending_count,
+                })
 
                 if pending:
                     logger.info("Worker: %d actionable, %d active, %d slots",
@@ -217,6 +230,7 @@ async def _process_one(req: dict, deferred: dict = None, retry_after: dict = Non
 
     logger.info("Processing request %s type=%s", rid[:8], req_type)
     await crud.update_request(rid, status="PROCESSING")
+    await event_bus.emit("request_update", {"id": rid, "status": "PROCESSING", "type": req_type})
 
     try:
         result = await _dispatch(req, orientation)
@@ -231,9 +245,11 @@ async def _process_one(req: dict, deferred: dict = None, retry_after: dict = Non
                     await apply_character_result(char_id, gen_result)
             else:
                 await apply_scene_result(req.get("scene_id"), req_type, orientation, gen_result)
+            await event_bus.emit("request_update", {"id": rid, "status": "COMPLETED"})
             logger.info("Request %s COMPLETED: media=%s", rid[:8], gen_result.media_id[:20] if gen_result.media_id else "?")
     except Exception as e:
         logger.exception("Request %s exception: %s", rid[:8], e)
+        await event_bus.emit("request_update", {"id": rid, "status": "FAILED", "error": str(e)})
         await _handle_failure(rid, req, {"error": str(e)}, retry_after)
 
 

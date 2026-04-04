@@ -208,6 +208,25 @@ async def list_scenes(video_id: str) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
+async def list_scenes_by_media_id(media_id: str) -> list[dict]:
+    """Find scenes where any media_id field matches the given UUID."""
+    db = await get_db()
+    cur = await db.execute(
+        """SELECT * FROM scene WHERE
+           vertical_image_media_id=? OR horizontal_image_media_id=?
+           OR vertical_video_media_id=? OR horizontal_video_media_id=?
+           OR vertical_upscale_media_id=? OR horizontal_upscale_media_id=?""",
+        (media_id, media_id, media_id, media_id, media_id, media_id))
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def list_characters_by_media_id(media_id: str) -> list[dict]:
+    """Find characters where media_id matches."""
+    db = await get_db()
+    cur = await db.execute("SELECT * FROM character WHERE media_id=?", (media_id,))
+    return [dict(r) for r in await cur.fetchall()]
+
+
 # ─── Request ────────────────────────────────────────────────
 
 async def create_request(req_type: str, orientation: str = None,
