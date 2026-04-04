@@ -41,19 +41,25 @@ Logic:
    - Set `vertical_end_scene_media_id` = parent's `vertical_image_media_id`
 3. ROOT scenes and the last scene: no endImage (leave `vertical_end_scene_media_id` null)
 
-## Step 3: Generate videos ONE AT A TIME, in order
+## Step 3: Generate videos in BATCHES OF 5, in chain order
 
-Process in display_order (scene 1 first, then 2, etc.):
+**CRITICAL: Google Flow handles max 5 concurrent requests.** Chain videos must process in display_order (scene N's endImage feeds scene N+1). Submit up to 5 from the same chain level, poll until done, then next 5.
 
-```bash
-curl -X POST http://127.0.0.1:8100/api/requests \
-  -H "Content-Type: application/json" \
-  -d '{"type": "GENERATE_VIDEO", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
+```
+For each batch of 5 scenes (in display_order):
+  1. Submit 5 requests:
+     curl -X POST http://127.0.0.1:8100/api/requests \
+       -H "Content-Type: application/json" \
+       -d '{"type": "GENERATE_VIDEO", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
+  
+  2. Poll every 15s until all 5 are COMPLETED or FAILED
+  
+  3. When batch done → submit next 5
 ```
 
 The worker automatically reads `vertical_end_scene_media_id` and passes it as `endImage` to the API. This triggers `start_end_frame_2_video` (i2v_fl) instead of plain `frame_2_video` (i2v).
 
-Poll every 15s. Max wait: 600s per scene.
+Max wait: 600s per scene. NEVER submit all at once.
 
 ## Known Limitation: Concat Gap
 

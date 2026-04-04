@@ -20,17 +20,23 @@ curl -s "http://127.0.0.1:8100/api/scenes?video_id=<VID>"
 
 Filter to scenes where `vertical_image_status` != `"COMPLETED"` or `vertical_image_media_id` is missing/not UUID.
 
-## Step 3: Create requests ONE AT A TIME
+## Step 3: Create requests in BATCHES OF 5
 
-For each scene needing an image:
+**CRITICAL: Google Flow handles max 5 concurrent requests.** Submit 5, poll until done, then submit next 5.
 
-```bash
-curl -X POST http://127.0.0.1:8100/api/requests \
-  -H "Content-Type: application/json" \
-  -d '{"type": "GENERATE_IMAGE", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
+```
+For each batch of 5 scenes needing an image:
+  1. Submit 5 requests:
+     curl -X POST http://127.0.0.1:8100/api/requests \
+       -H "Content-Type: application/json" \
+       -d '{"type": "GENERATE_IMAGE", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
+  
+  2. Poll every 10s until all 5 are COMPLETED or FAILED
+  
+  3. When batch done → submit next 5
 ```
 
-Poll every 10s until `COMPLETED` or `FAILED`. Max wait: 120s per scene.
+Max wait: 120s per scene. NEVER submit all at once — causes stuck PROCESSING requests.
 
 ## Step 4: Verify media_ids are UUID
 
