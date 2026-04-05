@@ -117,37 +117,40 @@ Ask user: "Review OK? Type 'yes' to generate TTS, or 'edit N' to modify scene N'
 
 ## Step 6: Generate TTS for all scenes
 
-**CRITICAL: Always use a registered template** (not raw `ref_audio`).
-The template stores `ref_text` — without it, voice cloning produces inconsistent voices across scenes.
+**CRITICAL: Always pass BOTH `ref_audio` AND `ref_text` together.**
+Without `ref_text`, OmniVoice falls back to generic voice → each scene sounds different.
 
-```bash
-curl -X POST "http://127.0.0.1:8100/api/videos/<VID>/narrate" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "project_id": "<PID>",
-    "template": "<template_name>",
-    "speed": 1.1,
-    "mix": false
-  }'
+### Proven workflow (per-scene via `/api/tts/generate`):
+
+The batch endpoint (`/api/videos/<VID>/narrate`) can timeout on large batches (40+ scenes).
+Use per-scene generation for reliability:
+
+```python
+for scene in scenes:
+    curl -s -m 120 -X POST "http://127.0.0.1:8100/api/tts/generate" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "text": "<scene_narrator_text>",
+        "ref_audio": "<path_to_voice_template.wav>",
+        "ref_text": "<exact_transcript_of_voice_template>",
+        "speed": 1.1
+      }'
+    # Move output to: output/tts/<VID>/scene_{IDX3}_{scene_id}.wav
 ```
 
-The `template` parameter resolves both `ref_audio` (voice WAV) AND `ref_text` (transcript) from `templates.json`.
+### Where does `ref_text` come from?
 
-If user insists on raw `ref_audio`, always pass `ref_text` too:
-```bash
-curl -X POST "http://127.0.0.1:8100/api/videos/<VID>/narrate" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "project_id": "<PID>",
-    "ref_audio": "<voice_template_path>",
-    "ref_text": "<transcript of the voice template>",
-    "speed": 1.1,
-    "mix": false
-  }'
-```
+The `ref_text` is the **exact transcript** of what's spoken in `ref_audio`.
 
-**Why ref_text matters:** OmniVoice uses `ref_audio` + `ref_text` together for voice cloning.
-Without `ref_text`, it falls back to generic voice design → each scene sounds different.
+- If template was created via `/gla:gen-tts-template`: `ref_text` = the standard base transcript used during creation (stored in `templates.json`)
+- If template is a user-provided WAV: transcribe it first using whisper, then use that transcript as `ref_text` for all scenes
+
+### Key rules:
+- `ref_audio` = the voice template WAV file (voice timbre source)
+- `ref_text` = exact transcript of `ref_audio` (phoneme alignment)
+- Both MUST be provided together — never just `ref_audio` alone
+- Same `ref_audio` + `ref_text` for ALL scenes = consistent voice
+- `speed: 1.1` recommended for documentary pacing
 
 **mix: false** — we don't mix here. Mixing happens in `/gla:concat-fit-narrator`.
 

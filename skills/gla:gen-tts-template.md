@@ -17,14 +17,16 @@ Create a reusable voice template for consistent narration across all scenes.
 This ensures `ref_text` is always known — no need to extract/transcribe later.
 
 **Base transcript (English):**
-> The Strait of Hormuz, the narrowest point only thirty-three kilometers wide. Twenty percent of the world's oil passes through here every day.
+> In the year twenty twenty-four, the world changed forever. Nations rose and fell, heroes emerged from the shadows, and ordinary people faced extraordinary challenges.
 
-**When user specifies a language**, translate the base transcript to their language before creating the template:
+**When user specifies a language**, translate the base transcript to their language:
 
-- Vietnamese → `"Eo biển Hormuz, nơi hẹp nhất chỉ ba mươi ba ki-lô-mét. Hai mươi phần trăm lượng dầu thế giới đi qua đây mỗi ngày."`
-- Japanese → `"ホルムズ海峡、最も狭い地点はわずか三十三キロメートル。世界の石油の二十パーセントが毎日ここを通過する。"`
-- Korean → `"호르무즈 해협, 가장 좁은 지점은 겨우 삼십삼 킬로미터. 세계 석유의 이십 퍼센트가 매일 이곳을 통과합니다."`
+- Vietnamese → `"Năm hai nghìn không trăm hai mươi tư, thế giới thay đổi mãi mãi. Các quốc gia hưng thịnh và sụp đổ, anh hùng xuất hiện từ bóng tối, và những người bình thường đối mặt với thử thách phi thường."`
+- Japanese → `"二千二十四年、世界は永遠に変わった。国々は興亡し、英雄は影から現れ、普通の人々は非凡な試練に直面した。"`
+- Korean → `"이천이십사년, 세계는 영원히 변했습니다. 나라들이 흥망하고, 영웅들이 그림자에서 나타나고, 평범한 사람들이 비범한 도전에 직면했습니다."`
 - (Any other language: translate the base transcript yourself)
+
+**Why this text?** It's generic (not project-specific), covers varied phonemes (numbers, nouns, verbs), and is ~5s at normal speed — ideal for voice cloning reference.
 
 ```bash
 # Example: Vietnamese template

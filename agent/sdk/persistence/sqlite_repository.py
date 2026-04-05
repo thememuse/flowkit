@@ -92,6 +92,7 @@ class SQLiteRepository(Repository):
             "trim_start": scene.trim_start,
             "trim_end": scene.trim_end,
             "duration": scene.duration,
+            "narrator_text": scene.narrator_text,
             # Vertical
             "vertical_image_url": scene.vertical.image.url,
             "vertical_image_media_id": scene.vertical.image.media_id,
