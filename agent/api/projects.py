@@ -1,5 +1,11 @@
 import logging
+import pathlib
+import re
+
+import aiohttp
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
 from agent.models.project import Project, ProjectCreate, ProjectUpdate
 from agent.models.character import Character
 from agent.sdk.persistence.sqlite_repository import SQLiteRepository
@@ -256,3 +262,108 @@ async def unlink_character(pid: str, cid: str):
 async def get_characters(pid: str):
     repo = _get_repo()
     return await repo.get_project_characters(pid)
+
+
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+_ASPECT_RATIO_MAP = {
+    "LANDSCAPE": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "PORTRAIT": "IMAGE_ASPECT_RATIO_PORTRAIT",
+}
+
+
+class ThumbnailRequest(BaseModel):
+    prompt: str
+    character_names: list[str] = []
+    aspect_ratio: str = "LANDSCAPE"
+    output_filename: str = "thumbnail.png"
+
+
+class ThumbnailResponse(BaseModel):
+    success: bool
+    media_id: str | None = None
+    image_url: str | None = None
+    output_path: str | None = None
+    prompt: str | None = None
+    error: str | None = None
+
+
+@router.post("/{pid}/generate-thumbnail", response_model=ThumbnailResponse)
+async def generate_thumbnail(pid: str, body: ThumbnailRequest):
+    """Generate a thumbnail image for a project via Google Flow API (synchronous, no queue)."""
+    from agent.materials import get_material
+    from agent.sdk.services.result_handler import parse_result
+
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+
+    repo = _get_repo()
+    project = await repo.get_project(pid)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Build full prompt: prepend material scene_prefix for style consistency
+    project_dict = project if isinstance(project, dict) else project.model_dump()
+    material_id = project_dict.get("material") or "3d_pixar"
+    material = get_material(material_id)
+    scene_prefix = material["scene_prefix"] if material and material.get("scene_prefix") else ""
+    full_prompt = f"{scene_prefix} {body.prompt}".strip() if scene_prefix else body.prompt
+
+    # Resolve character reference media_ids (error if any named entity is missing media_id)
+    character_media_ids = None
+    if body.character_names:
+        entities = await repo.get_project_characters(pid)
+        valid_ids = []
+        missing = []
+        for entity in entities:
+            if entity["name"] not in body.character_names:
+                continue
+            mid = entity.get("media_id")
+            if mid:
+                valid_ids.append(mid)
+            else:
+                missing.append(entity["name"])
+        if missing:
+            raise HTTPException(400, f"Missing reference images for: {', '.join(missing)}. Generate ref images first.")
+        character_media_ids = valid_ids if valid_ids else None
+
+    aspect_ratio = _ASPECT_RATIO_MAP.get(body.aspect_ratio.upper(), "IMAGE_ASPECT_RATIO_LANDSCAPE")
+    tier = project_dict.get("user_paygate_tier", "PAYGATE_TIER_TWO")
+
+    raw = await client.generate_images(
+        prompt=full_prompt,
+        project_id=pid,
+        aspect_ratio=aspect_ratio,
+        user_paygate_tier=tier,
+        character_media_ids=character_media_ids,
+    )
+
+    gen_result = parse_result(raw, "GENERATE_IMAGE")
+    if not gen_result.success:
+        raise HTTPException(502, gen_result.error or "Image generation failed")
+
+    # Download and save to output/{project_name}/{filename}
+    project_name = re.sub(r"[^\w\s-]", "", project_dict.get("name", "project")).strip().replace(" ", "_").lower()
+    out_dir = _PROJECT_ROOT / "output" / project_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / body.output_filename
+
+    if gen_result.url and gen_result.url.startswith("http"):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(gen_result.url) as resp:
+                    if resp.status == 200:
+                        output_path.write_bytes(await resp.read())
+                    else:
+                        raise HTTPException(502, f"Failed to download image: HTTP {resp.status}")
+        except aiohttp.ClientError as e:
+            raise HTTPException(502, f"Failed to download image: {e}") from e
+
+    return ThumbnailResponse(
+        success=True,
+        media_id=gen_result.media_id,
+        image_url=gen_result.url,
+        output_path=str(output_path),
+        prompt=full_prompt,
+    )
