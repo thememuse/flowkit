@@ -83,8 +83,8 @@ For each scene, single ffmpeg pass — trim, normalize resolution, and mix TTS:
 ### Scene WITH TTS:
 
 ```bash
-ffmpeg -y -i "$VIDEO_FILE" -i "$TTS_WAV" \
-  -ss 1 -t ${CUT_DUR} \
+ffmpeg -y -ss 1 -i "$VIDEO_FILE" -i "$TTS_WAV" \
+  -t ${CUT_DUR} \
   -filter_complex "[0:a]volume=0.3[bg];[1:a]volume=1.5[fg];[bg][fg]amix=inputs=2:duration=first[aout]" \
   -map 0:v -map "[aout]" \
   -c:v libx264 -preset fast -crf 18 \
@@ -96,9 +96,10 @@ ffmpeg -y -i "$VIDEO_FILE" -i "$TTS_WAV" \
 ```
 
 **Key flags:**
-- `-ss 1` — starts from 1s (skips the first second of each scene — often a static frame before motion begins)
-- `-t ${CUT_DUR}` — trims output to narrator duration + buffer (from the 1s start point)
-- `duration=first` — audio output matches the first input (video SFX, 8s), which `-t` then trims to cut duration. TTS plays fully within this window since cut = tts_dur + buffer.
+- `-ss 1` (before `-i "$VIDEO_FILE"`) — input seek on video only, skips first 1s static frame. Does NOT affect TTS input.
+- TTS (`$TTS_WAV`) starts from 0s — narration plays from the very beginning of the trimmed output.
+- `-t ${CUT_DUR}` — trims output to narrator duration + buffer
+- `duration=first` — audio output matches the first input (video SFX), which `-t` then trims to cut duration. TTS plays fully within this window since cut = tts_dur + buffer.
 - `volume=0.3` for SFX, `volume=1.5` for narrator
 - Do NOT use `apad` — it generates infinite silence and stalls the pipeline
 
