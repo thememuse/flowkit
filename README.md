@@ -368,7 +368,7 @@ Skills work with any AI CLI that can read files:
 
 ## Worker Behavior
 
-- **Max 5 concurrent requests** — Google Flow processes max 5 at a time. Submitting more causes stuck PROCESSING. Always batch in groups of 5: submit 5 → poll → next 5.
+- **Server handles throttling** — worker enforces max 5 concurrent + 10s cooldown automatically. Use `POST /api/requests/batch` to submit all at once; do NOT manually batch.
 - **10s cooldown** between API calls (anti-spam, configurable via `API_COOLDOWN`)
 - **Reference blocking** — scene image gen refuses if any referenced entity is missing `media_id`
 - **Skip completed** — won't re-generate already-completed assets

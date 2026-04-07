@@ -20,23 +20,30 @@ curl -s "http://127.0.0.1:8100/api/scenes?video_id=<VID>"
 
 Filter to scenes where `vertical_image_status` != `"COMPLETED"` or `vertical_image_media_id` is missing/not UUID.
 
-## Step 3: Create requests in BATCHES OF 5
+## Step 3: Submit ALL requests at once
 
-**CRITICAL: Google Flow handles max 5 concurrent requests.** Submit 5, poll until done, then submit next 5.
+The server handles throttling automatically (max 5 concurrent, 10s cooldown). Submit everything in one batch call:
 
+```bash
+curl -X POST http://127.0.0.1:8100/api/requests/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      {"type": "GENERATE_IMAGE", "scene_id": "<SID1>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"},
+      {"type": "GENERATE_IMAGE", "scene_id": "<SID2>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}
+    ]
+  }'
 ```
-For each batch of 5 scenes needing an image:
-  1. Submit 5 requests:
-     curl -X POST http://127.0.0.1:8100/api/requests \
-       -H "Content-Type: application/json" \
-       -d '{"type": "GENERATE_IMAGE", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
-  
-  2. Poll every 10s until all 5 are COMPLETED or FAILED
-  
-  3. When batch done → submit next 5
-```
 
-Max wait: 120s per scene. NEVER submit all at once — causes stuck PROCESSING requests.
+Build the `requests` array from ALL scenes filtered in Step 2. Do NOT manually batch or loop.
+
+Poll aggregate status every 15s until done:
+
+```bash
+curl -s "http://127.0.0.1:8100/api/requests/batch-status?video_id=<VID>&type=GENERATE_IMAGE"
+# Wait for: "done": true
+# If "all_succeeded": false → some failed, check individual failures
+```
 
 ## Step 4: Verify media_ids are UUID
 

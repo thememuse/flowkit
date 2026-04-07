@@ -16,6 +16,20 @@ class RequestUpdate(BaseModel):
     request_id: Optional[str] = None
 
 
+class BatchRequestCreate(BaseModel):
+    requests: list[RequestCreate]
+
+
+class BatchStatus(BaseModel):
+    total: int
+    pending: int
+    processing: int
+    completed: int
+    failed: int
+    done: bool
+    all_succeeded: bool
+
+
 @router.post("", response_model=Request)
 async def create(body: RequestCreate):
     data = body.model_dump(exclude_none=True)
@@ -39,14 +53,73 @@ async def create(body: RequestCreate):
     return await crud.create_request(**data)
 
 
+@router.post("/batch", response_model=list[Request])
+async def create_batch(body: BatchRequestCreate):
+    """Submit multiple requests atomically. Server handles throttling (max 5 concurrent, 10s cooldown).
+    Duplicate active requests for the same scene+type are skipped (not errors)."""
+    results = []
+    for item in body.requests:
+        data = item.model_dump(exclude_none=True)
+        data["req_type"] = data.pop("type")
+        scene_id = data.get("scene_id")
+        character_id = data.get("character_id")
+        req_type = data.get("req_type")
+        # Idempotent: skip if active request already exists
+        if scene_id and req_type:
+            existing = await crud.list_requests(scene_id=scene_id)
+            active = [r for r in existing
+                      if r.get("type") == req_type
+                      and r.get("status") in ("PENDING", "PROCESSING")]
+            if active:
+                results.append(active[0])
+                continue
+        if character_id and req_type:
+            existing = await crud.list_requests(project_id=data.get("project_id"))
+            active = [r for r in existing
+                      if r.get("character_id") == character_id
+                      and r.get("type") == req_type
+                      and r.get("status") in ("PENDING", "PROCESSING")]
+            if active:
+                results.append(active[0])
+                continue
+        results.append(await crud.create_request(**data))
+    return results
+
+
 @router.get("", response_model=list[Request])
-async def list_all(scene_id: str = None, status: str = None):
-    return await crud.list_requests(scene_id=scene_id, status=status)
+async def list_all(scene_id: str = None, status: str = None,
+                   video_id: str = None, project_id: str = None):
+    return await crud.list_requests(scene_id=scene_id, status=status,
+                                    video_id=video_id, project_id=project_id)
 
 
 @router.get("/pending", response_model=list[Request])
 async def list_pending():
     return await crud.list_pending_requests()
+
+
+@router.get("/batch-status", response_model=BatchStatus)
+async def batch_status(video_id: str = None, project_id: str = None,
+                       type: str = None):
+    """Aggregate status for all requests matching the filter.
+    Poll this instead of polling N individual request IDs."""
+    rows = await crud.list_requests(video_id=video_id, project_id=project_id)
+    if type:
+        rows = [r for r in rows if r.get("type") == type]
+    counts = {"PENDING": 0, "PROCESSING": 0, "COMPLETED": 0, "FAILED": 0}
+    for r in rows:
+        s = r.get("status", "PENDING")
+        counts[s] = counts.get(s, 0) + 1
+    total = len(rows)
+    return BatchStatus(
+        total=total,
+        pending=counts["PENDING"],
+        processing=counts["PROCESSING"],
+        completed=counts["COMPLETED"],
+        failed=counts["FAILED"],
+        done=(counts["PENDING"] == 0 and counts["PROCESSING"] == 0),
+        all_succeeded=(counts["COMPLETED"] == total and total > 0),
+    )
 
 
 @router.get("/{rid}", response_model=Request)

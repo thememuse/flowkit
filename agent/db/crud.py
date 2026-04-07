@@ -246,13 +246,18 @@ async def create_request(req_type: str, orientation: str = None,
 async def get_request(rid: str): return await _get("request", "id", rid)
 async def update_request(rid: str, **kw): return await _update("request", "id", rid, **kw)
 
-async def list_requests(scene_id: str = None, status: str = None) -> list[dict]:
+async def list_requests(scene_id: str = None, status: str = None,
+                        video_id: str = None, project_id: str = None) -> list[dict]:
     db = await get_db()
     q, params = "SELECT * FROM request WHERE 1=1", []
     if scene_id:
         q += " AND scene_id=?"; params.append(scene_id)
     if status:
         q += " AND status=?"; params.append(status)
+    if video_id:
+        q += " AND video_id=?"; params.append(video_id)
+    if project_id:
+        q += " AND project_id=?"; params.append(project_id)
     q += " ORDER BY created_at DESC"
     cur = await db.execute(q, params)
     return [dict(r) for r in await cur.fetchall()]

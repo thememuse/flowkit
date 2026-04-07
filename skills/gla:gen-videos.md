@@ -14,23 +14,30 @@ curl -s "http://127.0.0.1:8100/api/scenes?video_id=<VID>"
 
 Only scenes where `vertical_video_status` != `"COMPLETED"` or `vertical_video_media_id` is missing.
 
-## Step 3: Create requests in BATCHES OF 5
+## Step 3: Submit ALL requests at once
 
-**CRITICAL: Google Flow handles max 5 concurrent requests.** Submit 5, poll until done, then submit next 5. Video generation takes 2-5 minutes per scene.
+The server handles throttling automatically (max 5 concurrent, 10s cooldown). Submit everything in one batch call. Video generation takes 2-5 minutes per scene.
 
+```bash
+curl -X POST http://127.0.0.1:8100/api/requests/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      {"type": "GENERATE_VIDEO", "scene_id": "<SID1>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"},
+      {"type": "GENERATE_VIDEO", "scene_id": "<SID2>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}
+    ]
+  }'
 ```
-For each batch of 5 scenes needing video:
-  1. Submit 5 requests:
-     curl -X POST http://127.0.0.1:8100/api/requests \
-       -H "Content-Type: application/json" \
-       -d '{"type": "GENERATE_VIDEO", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
-  
-  2. Poll every 15s until all 5 are COMPLETED or FAILED
-  
-  3. When batch done → submit next 5
-```
 
-Max wait: 600s (10 min) per scene. NEVER submit all at once — causes stuck PROCESSING requests.
+Build the `requests` array from ALL scenes filtered in Step 2. Do NOT manually batch or loop.
+
+Poll aggregate status every 30s until done (videos take longer):
+
+```bash
+curl -s "http://127.0.0.1:8100/api/requests/batch-status?video_id=<VID>&type=GENERATE_VIDEO"
+# Wait for: "done": true
+# If "all_succeeded": false → some failed, check individual failures
+```
 
 ## Step 4: Verify
 

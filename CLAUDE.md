@@ -32,11 +32,12 @@ curl -s http://127.0.0.1:8100/health
 12. **Character dialogue in sub-clips** — embed speech in quotes: `"0-3s: Medium tracking shot, Luna walks to bed. Luna says 'Bye mom, I love you, see you tomorrow.'"` Rules: max 10-15 words per character per 2-3s, multi-character exchanges OK (label each speaker: `Luna asks "Ready?" Hero replies "Let's go."`), use delivery verbs (says, whispers, shouts, asks, replies), silent segments are powerful.
 13. **Voice descriptions on characters** — `voice_description` field (max ~30 words) auto-appended to video prompts. Dialogue tone must match voice profile.
 14. **No background music** — the worker auto-appends "No background music. Keep only natural sound effects." to all video prompts.
-15. **Max 5 concurrent requests to Google Flow** — Google's API processes max 5 requests simultaneously. Submitting more causes requests to get stuck in PROCESSING state forever. **Always batch in groups of 5**: submit 5 → poll every 10s → when batch completes → submit next 5. NEVER submit all 40 scene requests at once.
+15. **Server handles throttling** — the worker enforces max 5 concurrent requests and 10s cooldown automatically. Use `POST /api/requests/batch` to submit ALL requests at once. Do NOT manually batch in groups of 5 — that complexity lives server-side. Poll `GET /api/requests/batch-status?video_id=<VID>` for aggregate progress.
 16. **Image Material required on project** — every project must have a `material` field (e.g., `realistic`, `3d_pixar`, `anime`, `stop_motion`, `minecraft`, `oil_painting`). Material controls image_prompt style for entities AND scene_prefix for scenes. List available: `GET /api/materials`.
 17. **TTS voice template first** — before narrating scenes, create a voice template (`POST /api/tts/templates`) and verify the voice. Use the template as `ref_audio` for voice cloning to ensure consistent narrator voice across all scenes. CPU-only (MPS produces gibberish).
 18. **Statusline** — GLA statusline auto-shows at bottom of Claude Code. Configured by `setup.sh`. Shows: extension status, auth, tier, project, scene counts, img/vid/4K progress, queue. Reads Claude session stats from stdin for model/ctx%/rate limits.
 19. **Token auto-refresh** — Extension refreshes token every 45 min. Auto-opens Flow tab if none exists. Side panel warns when token stale (>60 min). Resends cached token on WS reconnect.
+20. **No throwaway scripts** — NEVER write a Python script, shell script, or any file to loop over API requests. All operations must be done inline with `curl` calls. To submit N requests, use `POST /api/requests/batch`. The server throttles automatically — no loops needed.
 
 **Complete video_prompt example:**
 ```
@@ -122,26 +123,25 @@ The worker auto-appends voice context + "no background music" to video_prompt be
 
 ### W3: Generate Reference Images
 
-Create a request for EACH entity. Do this BEFORE scene images.
+Do this BEFORE scene images. Submit all entities in one batch call.
 
 ```bash
 # Get entity list
 curl -s http://127.0.0.1:8100/api/projects/<PID>/characters
 
-# For each entity:
-curl -X POST http://127.0.0.1:8100/api/requests \
+# Submit ALL entities at once — server handles throttling (max 5 concurrent, 10s cooldown)
+curl -X POST http://127.0.0.1:8100/api/requests/batch \
   -H "Content-Type: application/json" \
-  -d '{
-    "type": "GENERATE_CHARACTER_IMAGE",
-    "character_id": "<entity_id>",
-    "project_id": "<PID>"
-  }'
+  -d '{"requests": [
+    {"type": "GENERATE_CHARACTER_IMAGE", "character_id": "<CID1>", "project_id": "<PID>"},
+    {"type": "GENERATE_CHARACTER_IMAGE", "character_id": "<CID2>", "project_id": "<PID>"}
+  ]}'
 ```
 
-**Poll until done:**
+**Poll aggregate status:**
 ```bash
-curl -s http://127.0.0.1:8100/api/requests/<RID>
-# Wait for status: "COMPLETED"
+curl -s "http://127.0.0.1:8100/api/requests/batch-status?project_id=<PID>&type=GENERATE_CHARACTER_IMAGE"
+# Wait for: "done": true
 ```
 
 **Verify ALL entities have media_id:**
@@ -154,22 +154,25 @@ curl -s http://127.0.0.1:8100/api/projects/<PID>/characters
 
 ### W4: Generate Scene Images
 
-Only after ALL reference images are ready.
+Only after ALL reference images are ready. Submit all scenes in one batch call.
 
 ```bash
-# For each scene:
-curl -X POST http://127.0.0.1:8100/api/requests \
+# Submit ALL scenes at once — server handles throttling
+curl -X POST http://127.0.0.1:8100/api/requests/batch \
   -H "Content-Type: application/json" \
-  -d '{
-    "type": "GENERATE_IMAGE",
-    "scene_id": "<SID>",
-    "project_id": "<PID>",
-    "video_id": "<VID>",
-    "orientation": "VERTICAL"
-  }'
+  -d '{"requests": [
+    {"type": "GENERATE_IMAGE", "scene_id": "<SID1>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"},
+    {"type": "GENERATE_IMAGE", "scene_id": "<SID2>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}
+  ]}'
 ```
 
 **Orientation:** `VERTICAL` (portrait 9:16) or `HORIZONTAL` (landscape 16:9)
+
+**Poll aggregate status:**
+```bash
+curl -s "http://127.0.0.1:8100/api/requests/batch-status?video_id=<VID>&type=GENERATE_IMAGE"
+# Wait for: "done": true
+```
 
 **What happens:** Worker collects all `media_id`s from entities listed in scene's `character_names`, passes them as `imageInputs`, generates image. If any entity is missing `media_id`, request fails and retries later.
 
@@ -181,22 +184,25 @@ curl -s "http://127.0.0.1:8100/api/scenes?video_id=<VID>"
 
 ### W5: Generate Videos
 
-Only after scene images are ready.
+Only after scene images are ready. Submit all scenes in one batch call.
 
 ```bash
-# For each scene with a completed image:
-curl -X POST http://127.0.0.1:8100/api/requests \
+# Submit ALL scenes at once — server handles throttling
+curl -X POST http://127.0.0.1:8100/api/requests/batch \
   -H "Content-Type: application/json" \
-  -d '{
-    "type": "GENERATE_VIDEO",
-    "scene_id": "<SID>",
-    "project_id": "<PID>",
-    "video_id": "<VID>",
-    "orientation": "VERTICAL"
-  }'
+  -d '{"requests": [
+    {"type": "GENERATE_VIDEO", "scene_id": "<SID1>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"},
+    {"type": "GENERATE_VIDEO", "scene_id": "<SID2>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}
+  ]}'
 ```
 
-**What happens:** Worker reads scene's `vertical_image_media_id` as `startImage`, submits video gen, polls until complete (can take 2-5 minutes). For CONTINUATION scenes with `parent_scene_id`, also uses `endImage` for smooth transitions.
+**Poll aggregate status (videos take 2-5 min each):**
+```bash
+curl -s "http://127.0.0.1:8100/api/requests/batch-status?video_id=<VID>&type=GENERATE_VIDEO"
+# Wait for: "done": true (poll every 30s)
+```
+
+**What happens:** Worker reads scene's `vertical_image_media_id` as `startImage`, submits video gen, polls until complete. For CONTINUATION scenes with `parent_scene_id`, also uses `endImage` for smooth transitions.
 
 **Verify:**
 ```bash
@@ -269,22 +275,23 @@ Returns slug + path + meta. Auto-creates directory structure + meta.json on firs
 2.5 Get output dir        GET  /api/projects/{pid}/output-dir (creates dir + meta.json)
 3.  Create video          POST /api/videos
 4.  Create scenes         POST /api/scenes (with character_names, chain_type, narrator_text)
-5.  Gen ref images        POST /api/requests {type: GENERATE_CHARACTER_IMAGE} per entity
-    ↳ BATCH 5 at a time, poll 10s, submit next 5 when done
-    ↳ Wait ALL complete, verify all have media_id (UUID)
-6.  Gen scene images      POST /api/requests {type: GENERATE_IMAGE} per scene
-    ↳ BATCH 5 at a time, poll 10s, submit next 5 when done
-    ↳ Wait ALL complete, verify image_media_id (UUID)
-7.  Gen videos            POST /api/requests {type: GENERATE_VIDEO} per scene
-    ↳ BATCH 5 at a time, poll 10s, submit next 5 when done (2-5 min each)
-8.  (Optional) Upscale    POST /api/requests {type: UPSCALE_VIDEO} per scene
-    ↳ BATCH 5 at a time (TIER_TWO only)
+5.  Gen ref images        POST /api/requests/batch (all entities)
+    ↳ Poll: GET /api/requests/batch-status?project_id=<PID>&type=GENERATE_CHARACTER_IMAGE
+    ↳ Wait for done=true, verify all entities have media_id (UUID)
+6.  Gen scene images      POST /api/requests/batch (all scenes)
+    ↳ Poll: GET /api/requests/batch-status?video_id=<VID>&type=GENERATE_IMAGE
+    ↳ Wait for done=true, verify image_media_id (UUID)
+7.  Gen videos            POST /api/requests/batch (all scenes)
+    ↳ Poll every 30s: GET /api/requests/batch-status?video_id=<VID>&type=GENERATE_VIDEO
+    ↳ Wait for done=true (videos take 2-5 min each)
+8.  (Optional) Upscale    POST /api/requests/batch (TIER_TWO only)
+    ↳ Poll: GET /api/requests/batch-status?video_id=<VID>&type=UPSCALE_VIDEO
 9.  (Optional) TTS        Create voice template → POST /api/videos/{vid}/narrate
     ↳ Requires narrator_text on scenes + voice template
 10. Download + concat     ffmpeg normalize + mix narration + concat
 ```
 
-**CRITICAL — Batch 5 rule:** Steps 5-8 MUST submit max 5 requests at a time. Poll every 10s. Submit next batch only after current batch completes. Submitting all at once causes stuck PROCESSING requests.
+**Server handles throttling:** The worker enforces max 5 concurrent + 10s cooldown. Submit ALL requests via `/batch` — do NOT manually stagger or loop.
 
 **Between steps 5→6:** MUST verify every entity has `media_id`. If any is missing, scene image gen will block.
 
@@ -303,6 +310,7 @@ Returns slug + path + meta. Auto-creates directory structure + meta.json on firs
 | Video | `POST /api/videos` | `GET /api/videos?project_id=X` | `GET /api/videos/{vid}` | `PATCH /api/videos/{vid}` | `DELETE /api/videos/{vid}` |
 | Scene | `POST /api/scenes` | `GET /api/scenes?video_id=X` | `GET /api/scenes/{sid}` | `PATCH /api/scenes/{sid}` | `DELETE /api/scenes/{sid}` |
 | Request | `POST /api/requests` | `GET /api/requests` | `GET /api/requests/{rid}` | `PATCH /api/requests/{rid}` | — |
+| Request (batch) | `POST /api/requests/batch` | — | — | — | — |
 
 ### Special Endpoints
 
@@ -311,6 +319,9 @@ Returns slug + path + meta. Auto-creates directory structure + meta.json on firs
 | `GET /health` | Server status + extension connected |
 | `GET /api/flow/status` | Extension connection + flow key status |
 | `GET /api/flow/credits` | User credits + tier |
+| `POST /api/requests/batch` | Submit N requests at once; server throttles automatically |
+| `GET /api/requests/batch-status?video_id=X` | Aggregate status (total/pending/processing/completed/failed/done) |
+| `GET /api/requests?video_id=X&project_id=Y` | List requests filtered by video and/or project |
 | `GET /api/requests/pending` | List pending requests |
 | `GET /api/projects/{pid}/characters` | List entities linked to project |
 | `POST /api/projects/{pid}/characters/{cid}` | Link entity to project |

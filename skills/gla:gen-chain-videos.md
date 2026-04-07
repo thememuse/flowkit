@@ -41,25 +41,30 @@ Logic:
    - Set `vertical_end_scene_media_id` = parent's `vertical_image_media_id`
 3. ROOT scenes and the last scene: no endImage (leave `vertical_end_scene_media_id` null)
 
-## Step 3: Generate videos in BATCHES OF 5, in chain order
+## Step 3: Submit ALL video requests at once
 
-**CRITICAL: Google Flow handles max 5 concurrent requests.** Chain videos must process in display_order (scene N's endImage feeds scene N+1). Submit up to 5 from the same chain level, poll until done, then next 5.
+The server handles throttling automatically (max 5 concurrent, 10s cooldown). The worker reads `vertical_end_scene_media_id` from each scene (set in Step 2) and passes it as `endImage` to the API. This triggers `start_end_frame_2_video` (i2v_fl) instead of plain `frame_2_video` (i2v).
 
+```bash
+curl -X POST http://127.0.0.1:8100/api/requests/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      {"type": "GENERATE_VIDEO", "scene_id": "<SID1>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"},
+      {"type": "GENERATE_VIDEO", "scene_id": "<SID2>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}
+    ]
+  }'
 ```
-For each batch of 5 scenes (in display_order):
-  1. Submit 5 requests:
-     curl -X POST http://127.0.0.1:8100/api/requests \
-       -H "Content-Type: application/json" \
-       -d '{"type": "GENERATE_VIDEO", "scene_id": "<SID>", "project_id": "<PID>", "video_id": "<VID>", "orientation": "VERTICAL"}'
-  
-  2. Poll every 15s until all 5 are COMPLETED or FAILED
-  
-  3. When batch done → submit next 5
+
+Build the `requests` array from ALL scenes in display_order. Do NOT manually batch or loop.
+
+Poll aggregate status every 30s until done:
+
+```bash
+curl -s "http://127.0.0.1:8100/api/requests/batch-status?video_id=<VID>&type=GENERATE_VIDEO"
+# Wait for: "done": true
+# If "all_succeeded": false → some failed, check individual failures
 ```
-
-The worker automatically reads `vertical_end_scene_media_id` and passes it as `endImage` to the API. This triggers `start_end_frame_2_video` (i2v_fl) instead of plain `frame_2_video` (i2v).
-
-Max wait: 600s per scene. NEVER submit all at once.
 
 ## Known Limitation: Concat Gap
 
