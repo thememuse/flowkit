@@ -283,11 +283,15 @@ async def get_output_dir(pid: str):
         (output_dir / subdir).mkdir(parents=True, exist_ok=True)
 
     videos = await repo.list_videos(pid)
-    video_id = videos[0].id if videos else None
+    video = videos[0] if videos else None
+    video_id = video.id if video else None
     scene_count = 0
     if video_id:
         scenes = await repo.list_scenes(video_id)
         scene_count = len(scenes) if scenes else 0
+
+    # Orientation lives on the video table, not project
+    video_orientation = (getattr(video, "orientation", None) if video else None) or "VERTICAL"
 
     now = datetime.now(timezone.utc).isoformat()
     meta = {
@@ -295,7 +299,7 @@ async def get_output_dir(pid: str):
         "project_name": project_name,
         "slug": slug,
         "video_id": video_id,
-        "orientation": getattr(project, "orientation", None) or (project.get("orientation") if isinstance(project, dict) else None) or "VERTICAL",
+        "orientation": video_orientation,
         "material": getattr(project, "material", None) or (project.get("material") if isinstance(project, dict) else None) or "",
         "scene_count": scene_count,
         "created_at": now,
