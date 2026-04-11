@@ -186,30 +186,96 @@ ffmpeg -y -i "${OUTDIR}/trimmed/scene_${IDX3}_${SCENE_ID}.mp4" \
 - Colons: replace `:` with `\:`
 - Percent signs: `%` → `%%`
 
-## Step 7: Create concat list and merge
+## Step 7: Create concat list and merge (with chain crossfade)
+
+### 7a. Group scenes into segments
+
+Group consecutive scenes into **segments** based on chain continuity:
+- A **chain segment** = consecutive scenes where each is CONTINUATION of the previous (same chain)
+- A **standalone segment** = a single ROOT scene not chained to adjacent scenes
+
+```python
+segments = []  # each segment is a list of trimmed file paths
+current_chain = []
+
+for i, scene in enumerate(sorted_scenes):
+    trimmed = f"{OUTDIR}/trimmed/scene_{scene['display_order']:03d}_{scene['id']}.mp4"
+    
+    if scene['chain_type'] == 'CONTINUATION' and current_chain:
+        # Continue the chain
+        current_chain.append(trimmed)
+    else:
+        # Flush previous chain
+        if current_chain:
+            segments.append(current_chain)
+        # Start new (ROOT starts a potential chain, or standalone)
+        current_chain = [trimmed]
+
+if current_chain:
+    segments.append(current_chain)
+```
+
+### 7b. Process each segment
+
+**Single-scene segments:** keep as-is (no transition needed).
+
+**Multi-scene chain segments (2+ scenes):** apply `xfade` cross-dissolve between consecutive scenes in the chain. This creates smooth crossfade transitions within continuous action sequences.
+
+```python
+XFADE_DUR = 0.5  # 0.5s crossfade overlap
+
+for segment in segments:
+    if len(segment) == 1:
+        # Standalone — add directly to final concat list
+        final_parts.append(segment[0])
+        continue
+    
+    # Multi-scene chain: pure cross-dissolve (no blur)
+    N = len(segment)
+    
+    # Step 1: Build xfade filter chain
+    vfilters = []
+    afilters = []
+    cumulative_dur = get_duration(segment[0])
+    
+    for i in range(N - 1):
+        offset = cumulative_dur - XFADE_DUR
+        
+        vin = '[0:v][1:v]' if i == 0 else f'[v{i}][{i+1}:v]'
+        vout = '[vout]' if i == N - 2 else f'[v{i+1}]'
+        vfilters.append(f'{vin}xfade=transition=fade:duration={XFADE_DUR}:offset={offset}{vout}')
+        
+        ain = '[0:a][1:a]' if i == 0 else f'[a{i}][{i+1}:a]'
+        aout = '[aout]' if i == N - 2 else f'[a{i+1}]'
+        afilters.append(f'{ain}acrossfade=d={XFADE_DUR}{aout}')
+        
+        cumulative_dur = offset + get_duration(segment[i+1])
+    
+    fc = ';'.join(vfilters + afilters)
+    chain_out = f"{OUTDIR}/trimmed/chain_{segment_index:03d}.mp4"
+    
+    # Step 2: Run xfade
+    ffmpeg -y {' '.join(f'-i {f}' for f in segment)} \
+      -filter_complex "{fc}" \
+      -map '[vout]' -map '[aout]' \
+      -c:v libx264 -preset fast -crf 18 -c:a aac -ar 48000 -ac 2 \
+      -pix_fmt yuv420p -movflags +faststart {chain_out}
+    
+    final_parts.append(chain_out)
+```
+
+### 7c. Final concat of all segments
 
 ```bash
 > concat_trimmed.txt
-# scenes array must be sorted by display_order; each entry has display_order and id
-for scene in "${SCENES[@]}"; do
-  IDX3=$(printf "%03d" "${scene[display_order]}")
-  SCENE_ID="${scene[id]}"
-  CANONICAL_TRIM="${OUTDIR}/trimmed/scene_${IDX3}_${SCENE_ID}.mp4"
-  # Fallback to legacy 2-digit name if canonical not found
-  LEGACY_TRIM="${OUTDIR}/trimmed/scene_$(printf "%02d" ${scene[display_order]}).mp4"
-  if [ -f "$CANONICAL_TRIM" ]; then
-    echo "file '$CANONICAL_TRIM'" >> concat_trimmed.txt
-  elif [ -f "$LEGACY_TRIM" ]; then
-    echo "file '$LEGACY_TRIM'" >> concat_trimmed.txt
-  else
-    echo "ERROR: missing trimmed file for scene ${IDX3}_${SCENE_ID}" >&2
-    exit 1
-  fi
-done
+for part in final_parts:
+    echo "file '${part}'" >> concat_trimmed.txt
 
 ffmpeg -y -f concat -safe 0 -i concat_trimmed.txt -c copy -movflags +faststart \
   "${OUTDIR}/${SLUG}_narrator_cut.mp4"
 ```
+
+**Note:** Chain segments are pre-rendered with xfade cross-dissolve, so `concat -c copy` works for the final merge. Non-chain segments are individual trimmed scenes. The result is: smooth cross-dissolve within chains, hard cuts between independent scenes (e.g., interview → cinematic → interview).
 
 ## Step 8: Verify and output
 
