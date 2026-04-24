@@ -1,5 +1,5 @@
 import { ChildProcess, execSync, spawn } from 'child_process'
-import { join } from 'path'
+import { delimiter, join } from 'path'
 import { existsSync } from 'fs'
 import { app } from 'electron'
 import { EventEmitter } from 'events'
@@ -71,9 +71,23 @@ class Sidecar extends EventEmitter {
         this.abortReady = false
         this.emit('status', 'Starting...')
 
+        const sidecarEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
+        if (app.isPackaged) {
+            const ffmpegDir = join(process.resourcesPath, 'ffmpeg')
+            if (existsSync(ffmpegDir)) {
+                const currentPath = process.env.PATH ?? process.env.Path ?? ''
+                const mergedPath = currentPath
+                    ? `${ffmpegDir}${delimiter}${currentPath}`
+                    : ffmpegDir
+                sidecarEnv.PATH = mergedPath
+                sidecarEnv.Path = mergedPath
+                console.log('[sidecar] Using bundled ffmpeg directory:', ffmpegDir)
+            }
+        }
+
         this.process = spawn(bin, args, {
             cwd,
-            env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+            env: sidecarEnv,
             stdio: ['ignore', 'pipe', 'pipe']
         })
 

@@ -66,6 +66,24 @@ jobs:
             --hidden-import websockets \
             agent/main.py
 
+      - name: Bundle ffmpeg + ffprobe binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "desktop/resources/ffmpeg" | Out-Null
+          $zipPath = Join-Path $env:RUNNER_TEMP "ffmpeg-release-essentials.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "ffmpeg-extract"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          $ffmpeg = Get-ChildItem $extractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          $ffprobe = Get-ChildItem $extractDir -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) {
+            throw "ffmpeg/ffprobe binaries not found in downloaded archive."
+          }
+          Copy-Item $ffmpeg.FullName "desktop/resources/ffmpeg/ffmpeg.exe" -Force
+          Copy-Item $ffprobe.FullName "desktop/resources/ffmpeg/ffprobe.exe" -Force
+          Get-Item "desktop/resources/ffmpeg/ffmpeg.exe" | Format-List Name,Length,FullName
+          Get-Item "desktop/resources/ffmpeg/ffprobe.exe" | Format-List Name,Length,FullName
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
