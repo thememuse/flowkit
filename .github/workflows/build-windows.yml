@@ -15,6 +15,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            agent
+            extension
+            desktop
+            requirements.txt
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -26,6 +32,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          pip install pillow
+
+      - name: Ensure Windows icon exists
+        shell: bash
+        run: |
+          if [ ! -f "desktop/resources/icon.ico" ]; then
+            python - <<'PY'
+from PIL import Image
+img = Image.open("desktop/resources/icon.png").convert("RGBA")
+img.save("desktop/resources/icon.ico", sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
+print("Generated desktop/resources/icon.ico")
+PY
+          fi
 
       - name: Bundle Python agent with PyInstaller
         shell: bash
