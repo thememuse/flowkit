@@ -15,6 +15,9 @@ let licenseEnforceTimer: ReturnType<typeof setInterval> | null = null
 let licenseEnforceInFlight = false
 let licenseRevokedLockdown = false
 let licenseRevokedNotified = false
+let extensionAutoReconnectTimer: ReturnType<typeof setTimeout> | null = null
+let extensionAutoReconnectInFlight = false
+let extensionAutoReconnectAttempts = 0
 
 // Ensure unique app identity in dev mode to avoid collisions with generic Electron apps.
 app.setName('FlowKit')
@@ -43,6 +46,7 @@ const LICENSE_CONFIG_PATH = join(app.getPath('userData'), 'license-config.json')
 const LICENSE_CACHE_PATH = join(app.getPath('userData'), 'license-cache.json')
 const DEFAULT_LICENSE_API = process.env.FLOWKIT_LICENSE_API_BASE ?? DEFAULT_LICENSE_API_BASE
 const LICENSE_REVOKE_POLL_MS = 5000
+const EXTENSION_AUTO_RECONNECT_MAX_ATTEMPTS = 8
 
 let lastLicenseCheck: LicenseCheckResult | null = null
 const refererPatchedPartitions = new Set<string>()
@@ -793,6 +797,12 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+type ExtensionReconnectResult = {
+    ok: boolean
+    method?: string
+    error?: string
+}
+
 async function waitForWebContentsReady(webContents: Electron.WebContents | null | undefined, timeoutMs = 8000): Promise<boolean> {
     if (!webContents || webContents.isDestroyed()) return false
     if (!webContents.isLoadingMainFrame()) return true
@@ -860,6 +870,126 @@ async function requestExtensionReconnectViaSidebar(): Promise<boolean> {
     }
 }
 
+function clearExtensionAutoReconnectTimer() {
+    if (extensionAutoReconnectTimer) {
+        clearTimeout(extensionAutoReconnectTimer)
+        extensionAutoReconnectTimer = null
+    }
+}
+
+async function performExtensionReconnect(): Promise<ExtensionReconnectResult> {
+    try {
+        // Ensure Flow window (and extension side panel) is alive.
+        await openFlowWindow({ focus: false, reveal: false })
+        createFlowSidebarWindow(false)
+        await waitForWebContentsReady(flowSidebarWindow?.webContents, 6000)
+        await waitForWebContentsReady(flowWindow?.webContents, 6000)
+
+        for (let i = 0; i < 3; i += 1) {
+            const sent = await requestExtensionReconnectViaSidebar()
+            if (sent) {
+                const connected = await waitForExtensionConnected(3500)
+                if (connected) return { ok: true, method: 'runtimeMessage' }
+            }
+            await sleep(600)
+        }
+
+        // Find the extension background service worker webContents
+        const allContents = (session.defaultSession as any).getAllWebContents?.()
+            ?? require('electron').webContents.getAllWebContents()
+        const bgContents = allContents.find((wc: Electron.WebContents) => {
+            const url = wc.getURL?.() ?? ''
+            return flowExtensionId
+                ? url.includes(`chrome-extension://${flowExtensionId}`) && url.includes('background')
+                : url.startsWith('chrome-extension://') && url.includes('background')
+        })
+        if (bgContents && !bgContents.isDestroyed()) {
+            try {
+                await bgContents.executeJavaScript(`
+                    try {
+                        manualDisconnect = false;
+                        connectToAgent();
+                    } catch(e) {}
+                `)
+                const connected = await waitForExtensionConnected(4500)
+                if (connected) return { ok: true, method: 'executeJavaScript' }
+            } catch (err) {
+                console.warn('[main] reconnect via background worker failed:', err)
+            }
+        }
+
+        // Fallback: reload extension via session
+        if (flowExtensionId) {
+            const flowSession = getCurrentFlowSession()
+            const extHost = getExtensionsHost(flowSession)
+            if (typeof extHost.reloadExtension === 'function') {
+                await extHost.reloadExtension(flowExtensionId)
+                // Ensure side panel points to the latest extension runtime.
+                if (flowSidebarWindow && !flowSidebarWindow.webContents.isDestroyed()) {
+                    const sidePanelUrl = `chrome-extension://${flowExtensionId}/side_panel.html`
+                    await flowSidebarWindow.webContents.loadURL(sidePanelUrl)
+                    await waitForWebContentsReady(flowSidebarWindow.webContents, 6000)
+                }
+                const sent = await requestExtensionReconnectViaSidebar()
+                const connected = sent ? await waitForExtensionConnected(5000) : false
+                if (connected) return { ok: true, method: 'reloadExtension' }
+            }
+        }
+        return { ok: false, error: 'Extension vẫn OFF sau nhiều lần reconnect' }
+    } catch (e: any) {
+        return { ok: false, error: e?.message ?? String(e) }
+    }
+}
+
+function scheduleExtensionAutoReconnect(reason: string, delayMs = 800) {
+    if (licenseRevokedLockdown) return
+    if (extensionAutoReconnectInFlight) return
+    if (extensionAutoReconnectTimer) return
+    if (extensionAutoReconnectAttempts >= EXTENSION_AUTO_RECONNECT_MAX_ATTEMPTS) {
+        console.warn('[main] Extension auto-reconnect reached max attempts, stop scheduling.')
+        return
+    }
+
+    extensionAutoReconnectTimer = setTimeout(async () => {
+        extensionAutoReconnectTimer = null
+        if (extensionAutoReconnectInFlight || licenseRevokedLockdown) return
+        extensionAutoReconnectInFlight = true
+        try {
+            try {
+                const healthRes = await fetch('http://127.0.0.1:8100/health', { signal: AbortSignal.timeout(1500) })
+                if (healthRes.ok) {
+                    const health = await healthRes.json() as { extension_connected?: boolean }
+                    if (Boolean(health?.extension_connected)) {
+                        extensionAutoReconnectAttempts = 0
+                        return
+                    }
+                }
+            } catch {
+                // health probe failed, continue reconnect attempts
+            }
+
+            extensionAutoReconnectAttempts += 1
+            const result = await performExtensionReconnect()
+            if (result.ok) {
+                extensionAutoReconnectAttempts = 0
+                console.log('[main] Extension auto-reconnect success via', result.method)
+                return
+            }
+
+            const backoffMs = Math.min(12000, 1200 * extensionAutoReconnectAttempts)
+            console.warn('[main] Extension auto-reconnect failed:', {
+                reason,
+                attempt: extensionAutoReconnectAttempts,
+                error: result.error,
+                retryInMs: backoffMs,
+            })
+            scheduleExtensionAutoReconnect('retry', backoffMs)
+        } finally {
+            extensionAutoReconnectInFlight = false
+        }
+    }, Math.max(0, delayMs))
+}
+
 async function getLicenseConfig() {
     return loadLicenseConfig(LICENSE_CONFIG_PATH, DEFAULT_LICENSE_API)
 }
@@ -912,6 +1042,8 @@ async function enforceLicenseRevocation(source: 'startup' | 'poll'): Promise<voi
                 })
             }
             licenseRevokedLockdown = true
+            clearExtensionAutoReconnectTimer()
+            extensionAutoReconnectAttempts = 0
             sidecar.stop()
 
             if (!licenseRevokedNotified) {
@@ -934,6 +1066,7 @@ async function enforceLicenseRevocation(source: 'startup' | 'poll'): Promise<voi
         if (licenseRevokedLockdown) {
             console.log('[license] Device re-activated. Resuming sidecar.')
             licenseRevokedLockdown = false
+            extensionAutoReconnectAttempts = 0
             sidecar.start()
         }
         licenseRevokedNotified = false
@@ -1218,67 +1351,12 @@ ipcMain.on('agent-ready', () => {
 })
 
 ipcMain.handle('reconnect-extension', async () => {
-    try {
-        // Ensure Flow window (and extension side panel) is alive.
-        await openFlowWindow({ focus: false, reveal: false })
-        createFlowSidebarWindow(false)
-        await waitForWebContentsReady(flowSidebarWindow?.webContents, 6000)
-        await waitForWebContentsReady(flowWindow?.webContents, 6000)
-
-        for (let i = 0; i < 3; i += 1) {
-            const sent = await requestExtensionReconnectViaSidebar()
-            if (sent) {
-                const connected = await waitForExtensionConnected(3500)
-                if (connected) return { ok: true, method: 'runtimeMessage' }
-            }
-            await sleep(600)
-        }
-
-        // Find the extension background service worker webContents
-        const allContents = (session.defaultSession as any).getAllWebContents?.()
-            ?? require('electron').webContents.getAllWebContents()
-        const bgContents = allContents.find((wc: Electron.WebContents) => {
-            const url = wc.getURL?.() ?? ''
-            return flowExtensionId
-                ? url.includes(`chrome-extension://${flowExtensionId}`) && url.includes('background')
-                : url.startsWith('chrome-extension://') && url.includes('background')
-        })
-        if (bgContents && !bgContents.isDestroyed()) {
-            try {
-                await bgContents.executeJavaScript(`
-                    try {
-                        manualDisconnect = false;
-                        connectToAgent();
-                    } catch(e) {}
-                `)
-                const connected = await waitForExtensionConnected(4500)
-                if (connected) return { ok: true, method: 'executeJavaScript' }
-            } catch (err) {
-                console.warn('[main] reconnect via background worker failed:', err)
-            }
-        }
-
-        // Fallback: reload extension via session
-        if (flowExtensionId) {
-            const flowSession = getCurrentFlowSession()
-            const extHost = getExtensionsHost(flowSession)
-            if (typeof extHost.reloadExtension === 'function') {
-                await extHost.reloadExtension(flowExtensionId)
-                // Ensure side panel points to the latest extension runtime.
-                if (flowSidebarWindow && !flowSidebarWindow.webContents.isDestroyed()) {
-                    const sidePanelUrl = `chrome-extension://${flowExtensionId}/side_panel.html`
-                    await flowSidebarWindow.webContents.loadURL(sidePanelUrl)
-                    await waitForWebContentsReady(flowSidebarWindow.webContents, 6000)
-                }
-                const sent = await requestExtensionReconnectViaSidebar()
-                const connected = sent ? await waitForExtensionConnected(5000) : false
-                if (connected) return { ok: true, method: 'reloadExtension' }
-            }
-        }
-        return { ok: false, error: 'Extension vẫn OFF sau nhiều lần reconnect' }
-    } catch (e: any) {
-        return { ok: false, error: e?.message ?? String(e) }
+    const result = await performExtensionReconnect()
+    if (result.ok) {
+        extensionAutoReconnectAttempts = 0
+        clearExtensionAutoReconnectTimer()
     }
+    return result
 })
 
 // ─── App Lifecycle ───────────────────────────────────────────
@@ -1306,6 +1384,9 @@ app.whenReady().then(async () => {
 
     sidecar.on('status', (status: string) => {
         mainWindow?.webContents.send('agent-status', status)
+        if (status === 'Ready' && !licenseRevokedLockdown) {
+            scheduleExtensionAutoReconnect('sidecar-ready', 500)
+        }
     })
 })
 
@@ -1341,6 +1422,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
     appQuitting = true
     stopLicenseEnforcer()
+    clearExtensionAutoReconnectTimer()
     sidecar.stop()
 })
 
