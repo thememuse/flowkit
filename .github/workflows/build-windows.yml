@@ -92,11 +92,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload installer artifact
+      - name: Upload Windows artifacts (installer + portable + zip)
         uses: actions/upload-artifact@v4
         with:
-          name: flowkit-windows-installer
-          path: desktop/dist/*.exe
+          name: flowkit-windows-build
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.zip
           retention-days: 30
 
       - name: Upload to GitHub Release
@@ -104,6 +106,8 @@ jobs:
         continue-on-error: true
         uses: softprops/action-gh-release@v1
         with:
-          files: desktop/dist/*.exe
+          files: |
+            desktop/dist/*.exe
+            desktop/dist/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

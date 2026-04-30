@@ -462,7 +462,7 @@ function setTokenAuthState(nextState, error = null) {
 
 function isAuthFailureResponse(status, responseText = "") {
   if (status === 401) return true;
-  if (status !== 400) return false;
+  if (status !== 400 && status !== 403) return false;
   const text = String(responseText || "").toLowerCase();
   if (!text) return false;
   return (
@@ -472,8 +472,64 @@ function isAuthFailureResponse(status, responseText = "") {
     text.includes("invalid authentication") ||
     text.includes("invalid credentials") ||
     text.includes("login required") ||
+    text.includes("credentials_missing") ||
+    text.includes("expected oauth2 access token") ||
+    text.includes("api keys are not supported by this api") ||
     text.includes("missing required authentication credential")
   );
+}
+
+function isCaptchaLike403(responseText = "") {
+  const text = String(responseText || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("captcha") ||
+    text.includes("recaptcha") ||
+    text.includes("public_error_unusual_activity_too_much_traffic") ||
+    text.includes("too_much_traffic")
+  );
+}
+
+function extractApiErrorReason(responseData, responseText = "") {
+  const fromDetails = (errObj) => {
+    if (!errObj || typeof errObj !== "object") return "";
+    const msg = typeof errObj.message === "string" ? errObj.message : "";
+    const details = Array.isArray(errObj.details) ? errObj.details : [];
+    for (const row of details) {
+      if (row && typeof row === "object" && typeof row.reason === "string") {
+        return msg ? `${msg} [${row.reason}]` : row.reason;
+      }
+    }
+    return msg || "";
+  };
+
+  try {
+    if (responseData && typeof responseData === "object") {
+      const directErr = responseData.error;
+      if (typeof directErr === "string" && directErr.trim()) {
+        return directErr.trim();
+      }
+      if (directErr && typeof directErr === "object") {
+        const s = fromDetails(directErr);
+        if (s) return s;
+      }
+      const nested = responseData.data;
+      if (nested && typeof nested === "object") {
+        const nestedErr = nested.error;
+        if (typeof nestedErr === "string" && nestedErr.trim()) {
+          return nestedErr.trim();
+        }
+        if (nestedErr && typeof nestedErr === "object") {
+          const s = fromDetails(nestedErr);
+          if (s) return s;
+        }
+      }
+    }
+  } catch (_) {
+    // ignore parse failures
+  }
+
+  return String(responseText || "").trim();
 }
 
 function addRequestLog(entry) {
@@ -2385,12 +2441,12 @@ async function handleApiRequest(msg) {
       }
     }
 
-    // Token/context may be stale (401 and sometimes 400 on credits endpoint).
-    // Try one token-refresh + one retry.
+    // Token/context may be stale (401/403 and sometimes 400 on credits endpoint).
+    // Try one token-refresh + one retry even if token string stays unchanged.
     const shouldRetryAuth =
       response
       && (
-        response.status === 401
+        isAuthFailureResponse(response.status, responseText)
         || (isCreditsRead && response.status === 400)
       );
     if (shouldRetryAuth) {
@@ -2400,26 +2456,59 @@ async function handleApiRequest(msg) {
         // ignore refresh errors and keep original response
       }
       await sleep(900);
-      const refreshedFlowKey = flowKey;
-      if (refreshedFlowKey && refreshedFlowKey !== activeFlowKey) {
+      const refreshedFlowKey = flowKey || activeFlowKey;
+      if (refreshedFlowKey) {
         activeFlowKey = refreshedFlowKey;
-        try {
-          response = await performApiFetch(activeFlowKey, {
+      }
+      try {
+        response = await performApiFetch(activeFlowKey, {
+          minimal: isReadGet && (isMediaRead || isCreditsRead),
+          dropProjectContext: false,
+        });
+        responseText = await response.text();
+      } catch (retry401Err) {
+        if (!(isReadGet && (isMediaRead || isCreditsRead))) throw retry401Err;
+        const viaTab = await performFlowTabFetch(
+          buildFetchUrl({ dropProjectContext: false }),
+          methodUpper,
+          buildFetchHeaders(activeFlowKey, { minimal: true }),
+          finalBody,
+          requestProjectId,
+        );
+        applyTabResponse(viaTab);
+      }
+    }
+
+    // Some Google endpoints can reject extension-service-worker fetch (403)
+    // while succeeding from the actual Flow tab context.
+    const shouldRetryViaFlowTab =
+      response
+      && response.status === 403
+      && (
+        shouldRetryAuth
+        || !isCaptchaLike403(responseText)
+      );
+    if (shouldRetryViaFlowTab) {
+      try {
+        const viaTab = await performFlowTabFetch(
+          buildFetchUrl({ dropProjectContext: false }),
+          methodUpper,
+          buildFetchHeaders(activeFlowKey, {
             minimal: isReadGet && (isMediaRead || isCreditsRead),
-            dropProjectContext: false,
-          });
-          responseText = await response.text();
-        } catch (retry401Err) {
-          if (!(isReadGet && (isMediaRead || isCreditsRead))) throw retry401Err;
-          const viaTab = await performFlowTabFetch(
-            buildFetchUrl({ dropProjectContext: false }),
-            methodUpper,
-            buildFetchHeaders(activeFlowKey, { minimal: true }),
-            finalBody,
-            requestProjectId,
-          );
+          }),
+          finalBody,
+          requestProjectId,
+        );
+        // Prefer tab result when successful, or when it gives a different status
+        // that is easier for agent-side retry policies to classify.
+        if (
+          Number(viaTab?.status) < 400
+          || Number(viaTab?.status) !== Number(response.status)
+        ) {
           applyTabResponse(viaTab);
         }
+      } catch (_) {
+        // Keep current response on tab fallback failures.
       }
     }
 
@@ -2472,13 +2561,21 @@ async function handleApiRequest(msg) {
         responseSummary,
       });
     } else {
+      const reasonRaw = extractApiErrorReason(responseData, responseText);
+      const reason = String(reasonRaw || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 160);
+      const errorLabel = reason
+        ? `API_${response.status}: ${reason}`
+        : `API_${response.status}`;
       if (hasCaptcha) {
         metrics.failedCount++;
-        metrics.lastError = `API_${response.status}`;
+        metrics.lastError = errorLabel;
       }
       updateRequestLog(logId, {
         status: "failed",
-        error: `API_${response.status}`,
+        error: errorLabel,
         httpStatus: response.status,
         responseSummary,
       });

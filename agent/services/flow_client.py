@@ -350,8 +350,64 @@ def _is_model_access_denied(result: dict) -> bool:
     return (
         "public_error_model_access_denied" in text
         or "model_access_denied" in text
+        or "permission denied" in text
+        or "access denied" in text
         or "does not have permission" in text
     )
+
+
+def _is_captcha_or_safety_forbidden(result: dict) -> bool:
+    status = result.get("status")
+    if not (isinstance(status, int) and status == 403):
+        return False
+    text = _extract_error_text(result).lower()
+    return (
+        "captcha" in text
+        or "recaptcha" in text
+        or "too_much_traffic" in text
+        or "public_error_unusual_activity_too_much_traffic" in text
+        or "public_error_unsafe_generation" in text
+    )
+
+
+def _is_retryable_forbidden(result: dict) -> bool:
+    """True when 403 likely comes from model/account auth constraints, not captcha."""
+    status = result.get("status")
+    if not (isinstance(status, int) and status == 403):
+        return False
+    if _is_captcha_or_safety_forbidden(result):
+        return False
+    text = _extract_error_text(result).lower()
+    return (
+        _is_model_access_denied(result)
+        or "credentials_missing" in text
+        or "expected oauth2 access token" in text
+        or "api keys are not supported by this api" in text
+        or "forbidden" in text
+        or not text
+    )
+
+
+def _resolve_image_model_candidates(
+    *,
+    requested_model_key: str | None = None,
+) -> list[tuple[str, str]]:
+    """Return ordered, deduplicated image model candidates."""
+    candidates: list[tuple[str, str]] = []
+    if requested_model_key:
+        candidates.append(("requested", requested_model_key))
+
+    for alias, model_key in (IMAGE_MODELS or {}).items():
+        if isinstance(model_key, str) and model_key.strip():
+            candidates.append((f"config:{alias}", model_key.strip()))
+
+    seen: set[str] = set()
+    deduped: list[tuple[str, str]] = []
+    for source, model_key in candidates:
+        if model_key not in seen:
+            seen.add(model_key)
+            deduped.append((source, model_key))
+    return deduped
 
 
 def _model_key_variants(model_key: str) -> list[str]:
@@ -1832,43 +1888,62 @@ class FlowClient:
         Response structure:
             data.media[].name = mediaId (used for video gen)
         """
-        ts = int(time.time() * 1000)
         ctx = self._client_context(project_id, user_paygate_tier)
-
-        selected_image_model = image_model_key or IMAGE_MODELS["NANO_BANANA_PRO"]
-
-        request_item = {
-            "clientContext": {**ctx, "sessionId": f";{ts}"},
-            "seed": ts % 1000000,
-            "structuredPrompt": {"parts": [{"text": prompt}]},
-            "imageAspectRatio": aspect_ratio,
-            "imageModelName": selected_image_model,
-        }
-
-        # Add character references if provided (edit_image flow)
-        if character_media_ids:
-            request_item["imageInputs"] = [
-                {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
-                for mid in character_media_ids
-            ]
-
-        batch_id = f"{uuid.uuid4()}" if character_media_ids else None
-        body = {
-            "clientContext": ctx,
-            "requests": [request_item],
-        }
-        if batch_id:
-            body["mediaGenerationContext"] = {"batchId": batch_id}
-            body["useNewMedia"] = True
+        candidates = _resolve_image_model_candidates(requested_model_key=image_model_key)
+        if not candidates:
+            return {"error": "No image model candidates available"}
 
         url = self._build_url("generate_images", project_id=project_id)
-        return await self._send("api_request", {
-            "url": url,
-            "method": "POST",
-            "headers": random_headers(),
-            "body": body,
-            "captchaAction": "IMAGE_GENERATION",
-        })
+        last_result: dict | None = None
+
+        for idx, (source, selected_image_model) in enumerate(candidates):
+            ts = int(time.time() * 1000)
+            request_item = {
+                "clientContext": {**ctx, "sessionId": f";{ts}"},
+                "seed": ts % 1000000,
+                "structuredPrompt": {"parts": [{"text": prompt}]},
+                "imageAspectRatio": aspect_ratio,
+                "imageModelName": selected_image_model,
+            }
+
+            # Add character references if provided (edit-image style generation)
+            if character_media_ids:
+                request_item["imageInputs"] = [
+                    {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
+                    for mid in character_media_ids
+                ]
+
+            batch_id = f"{uuid.uuid4()}" if character_media_ids else None
+            body = {
+                "clientContext": ctx,
+                "requests": [request_item],
+            }
+            if batch_id:
+                body["mediaGenerationContext"] = {"batchId": batch_id}
+                body["useNewMedia"] = True
+
+            result = await self._send("api_request", {
+                "url": url,
+                "method": "POST",
+                "headers": random_headers(),
+                "body": body,
+                "captchaAction": "IMAGE_GENERATION",
+            })
+            last_result = result
+
+            if not _is_retryable_forbidden(result):
+                if idx > 0:
+                    logger.info("generate_images recovered with fallback model=%s", selected_image_model)
+                return result
+
+            logger.warning(
+                "generate_images forbidden for model=%s (%s): %s",
+                selected_image_model,
+                source,
+                _extract_error_text(result),
+            )
+
+        return last_result or {"error": "Image generation failed with all model candidates"}
 
     async def edit_image(self, prompt: str, source_media_id: str,
                           project_id: str,
@@ -1882,7 +1957,6 @@ class FlowClient:
         after the base image. Order: [base_image, char_A, char_B, ...].
         This helps Google Flow detect characters for consistent edits.
         """
-        ts = int(time.time() * 1000)
         ctx = self._client_context(project_id, user_paygate_tier)
 
         image_inputs = [
@@ -1892,32 +1966,53 @@ class FlowClient:
             for mid in character_media_ids:
                 image_inputs.append({"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"})
 
-        selected_image_model = image_model_key or IMAGE_MODELS["NANO_BANANA_PRO"]
-
-        request_item = {
-            "clientContext": {**ctx, "sessionId": f";{ts}"},
-            "seed": ts % 1000000,
-            "structuredPrompt": {"parts": [{"text": prompt}]},
-            "imageAspectRatio": aspect_ratio,
-            "imageModelName": selected_image_model,
-            "imageInputs": image_inputs,
-        }
-
-        body = {
-            "clientContext": ctx,
-            "mediaGenerationContext": {"batchId": f"{uuid.uuid4()}"},
-            "useNewMedia": True,
-            "requests": [request_item],
-        }
+        candidates = _resolve_image_model_candidates(requested_model_key=image_model_key)
+        if not candidates:
+            return {"error": "No image model candidates available"}
 
         url = self._build_url("generate_images", project_id=project_id)
-        return await self._send("api_request", {
-            "url": url,
-            "method": "POST",
-            "headers": random_headers(),
-            "body": body,
-            "captchaAction": "IMAGE_GENERATION",
-        })
+        last_result: dict | None = None
+
+        for idx, (source, selected_image_model) in enumerate(candidates):
+            ts = int(time.time() * 1000)
+            request_item = {
+                "clientContext": {**ctx, "sessionId": f";{ts}"},
+                "seed": ts % 1000000,
+                "structuredPrompt": {"parts": [{"text": prompt}]},
+                "imageAspectRatio": aspect_ratio,
+                "imageModelName": selected_image_model,
+                "imageInputs": image_inputs,
+            }
+
+            body = {
+                "clientContext": ctx,
+                "mediaGenerationContext": {"batchId": f"{uuid.uuid4()}"},
+                "useNewMedia": True,
+                "requests": [request_item],
+            }
+
+            result = await self._send("api_request", {
+                "url": url,
+                "method": "POST",
+                "headers": random_headers(),
+                "body": body,
+                "captchaAction": "IMAGE_GENERATION",
+            })
+            last_result = result
+
+            if not _is_retryable_forbidden(result):
+                if idx > 0:
+                    logger.info("edit_image recovered with fallback model=%s", selected_image_model)
+                return result
+
+            logger.warning(
+                "edit_image forbidden for model=%s (%s): %s",
+                selected_image_model,
+                source,
+                _extract_error_text(result),
+            )
+
+        return last_result or {"error": "Edit image failed with all model candidates"}
 
     async def generate_video(self, start_image_media_id: str, prompt: str,
                               project_id: str, scene_id: str,
