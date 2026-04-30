@@ -530,7 +530,7 @@ function createMainWindow() {
         mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
     } else {
         // electron-vite outputs renderer assets to out/renderer in preview/production
-        mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+        mainWindow.loadFile(join(__dirname, '../renderer/index.html'), { hash: '/' })
     }
 
     mainWindow.once('ready-to-show', () => {

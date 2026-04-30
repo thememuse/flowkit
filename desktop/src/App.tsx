@@ -1,4 +1,4 @@
-import { BrowserRouter, NavLink, Routes, Route, useLocation } from 'react-router-dom'
+import { HashRouter, NavLink, Routes, Route, useLocation } from 'react-router-dom'
 import {
     LayoutDashboard,
     FolderOpen,
@@ -545,9 +545,9 @@ export default function App() {
         <div className="h-full w-full flex flex-col">
             <AppWindowHeader />
             <div className="flex-1 min-h-0">
-                <BrowserRouter>
+                <HashRouter>
                     <Layout />
-                </BrowserRouter>
+                </HashRouter>
             </div>
         </div>
     )
