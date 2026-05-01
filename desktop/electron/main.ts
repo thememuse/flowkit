@@ -18,6 +18,7 @@ let licenseRevokedNotified = false
 let extensionAutoReconnectTimer: ReturnType<typeof setTimeout> | null = null
 let extensionAutoReconnectInFlight = false
 let extensionAutoReconnectAttempts = 0
+let latestAgentStatus = 'Starting...'
 
 // Ensure unique app identity in dev mode to avoid collisions with generic Electron apps.
 app.setName('FlowKit')
@@ -298,6 +299,11 @@ function emitFlowPanelStateChanged() {
     mainWindow?.webContents.send('flow-panel-state-changed', getFlowPanelStatePayload())
 }
 
+function setAgentStatus(status: string) {
+    latestAgentStatus = status
+    mainWindow?.webContents.send('agent-status', status)
+}
+
 // In dev mode, use local extension path
 const extensionPath = app.isPackaged
     ? EXTENSION_PATH
@@ -549,6 +555,7 @@ function createMainWindow() {
 
     mainWindow.webContents.on('did-finish-load', () => {
         console.log('[main] Main window renderer loaded:', mainWindow?.webContents.getURL())
+        setAgentStatus(latestAgentStatus)
         emitFlowPanelStateChanged()
     })
 
@@ -1344,6 +1351,7 @@ ipcMain.handle('window-is-maximized', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return false
     return mainWindow.isMaximized()
 })
+ipcMain.handle('get-agent-status', () => latestAgentStatus)
 
 ipcMain.on('agent-ready', () => {
     // Forward to renderer
@@ -1379,15 +1387,15 @@ app.whenReady().then(async () => {
 
     startLicenseEnforcer()
 
-    // Start Python sidecar
-    sidecar.start()
-
     sidecar.on('status', (status: string) => {
-        mainWindow?.webContents.send('agent-status', status)
+        setAgentStatus(status)
         if (status === 'Ready' && !licenseRevokedLockdown) {
             scheduleExtensionAutoReconnect('sidecar-ready', 500)
         }
     })
+
+    // Start Python sidecar
+    sidecar.start()
 })
 
 app.on('second-instance', () => {

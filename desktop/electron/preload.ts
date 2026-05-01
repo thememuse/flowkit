@@ -77,6 +77,8 @@ contextBridge.exposeInMainWorld('electron', {
 
     /** Get current health status from Python agent */
     getHealth: () => ipcRenderer.invoke('get-health'),
+    /** Get latest sidecar status snapshot */
+    getAgentStatus: () => ipcRenderer.invoke('get-agent-status') as Promise<string>,
 
     /** Reconnect Chrome extension WebSocket to agent */
     reconnectExtension: () => ipcRenderer.invoke('reconnect-extension') as Promise<{ ok: boolean; method?: string; error?: string }>,

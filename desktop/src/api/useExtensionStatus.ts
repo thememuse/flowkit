@@ -39,11 +39,9 @@ async function doCheck() {
             runtime.runtime_connected !== undefined
                 ? !!runtime.runtime_connected
                 : (!!runtime.connected && runtime.state !== 'off' && runtime.manual_disconnect !== true)
-        const hasFlowTab =
-            runtime.flow_tab_id === undefined
-                ? true
-                : ((runtime.flow_tab_id !== null && runtime.flow_tab_id !== undefined) || !!runtime.flow_tab_url)
-        const connected = wsConnected && runtimeConnected && hasFlowTab
+        // Global connection badge should reflect WS/runtime link.
+        // Flow-tab availability is validated separately at action time.
+        const connected = wsConnected && runtimeConnected
         broadcast(connected)
         return connected
     } catch {

@@ -1,6 +1,6 @@
 import { ChildProcess, execSync, spawn } from 'child_process'
 import { delimiter, join } from 'path'
-import { existsSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
 import { app } from 'electron'
 import { EventEmitter } from 'events'
 
@@ -14,6 +14,7 @@ const MAX_RETRIES = 5
 const RESTART_DELAY_MS = 3000
 const HEALTH_POLL_MS = 600
 const HEALTH_TIMEOUT_MS = 20000
+const AGENT_RUNTIME_DIR_NAME = 'agent-runtime'
 
 class Sidecar extends EventEmitter {
     private process: ChildProcess | null = null
@@ -99,6 +100,10 @@ class Sidecar extends EventEmitter {
         this.emit('status', 'Starting...')
 
         const sidecarEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
+        const runtimeDir = this._resolveAgentRuntimeDir()
+        if (runtimeDir) {
+            sidecarEnv.FLOW_AGENT_DIR = runtimeDir
+        }
         this._injectLocalUpscaleRuntimeEnv(sidecarEnv)
 
         this.process = spawn(bin, args, {
@@ -541,6 +546,17 @@ class Sidecar extends EventEmitter {
         }
 
         console.log('[sidecar] Local upscale runtime root:', chosenRoot)
+    }
+
+    private _resolveAgentRuntimeDir(): string {
+        try {
+            const runtimeDir = join(app.getPath('userData'), AGENT_RUNTIME_DIR_NAME)
+            mkdirSync(runtimeDir, { recursive: true })
+            return runtimeDir
+        } catch (err) {
+            console.warn('[sidecar] Failed to prepare persistent runtime dir, fallback to defaults:', err)
+            return ''
+        }
     }
 }
 

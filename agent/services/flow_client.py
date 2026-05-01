@@ -1775,6 +1775,17 @@ class FlowClient:
                 if not isinstance(raw_data, dict):
                     raw_data = result.get("result")
                 data = raw_data if isinstance(raw_data, dict) else {}
+                state = str(data.get("state") or "").lower()
+                agent_connected = bool(
+                    data.get("agentConnected", data.get("connected", False))
+                )
+
+                # When multiple extension workers exist (multi-session/account),
+                # the first responder can be an OFF worker. Prefer trying another
+                # candidate to find the live runtime worker.
+                if state == "off" or not agent_connected:
+                    return True
+
                 has_runtime_fields = any(
                     key in data
                     for key in (

@@ -92,6 +92,11 @@ function AgentStatusBadge() {
     const [status, setStatus] = useState('Đang khởi động...')
 
     useEffect(() => {
+        window.electron?.getAgentStatus?.()
+            .then((value) => {
+                if (value) setStatus(value)
+            })
+            .catch(() => { })
         if (window.electron?.onAgentStatus) {
             const unsub = window.electron.onAgentStatus(setStatus)
             return unsub
