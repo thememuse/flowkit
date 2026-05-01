@@ -18,6 +18,7 @@ let licenseRevokedNotified = false
 let extensionAutoReconnectTimer: ReturnType<typeof setTimeout> | null = null
 let extensionAutoReconnectInFlight = false
 let extensionAutoReconnectAttempts = 0
+let extensionWatchdogTimer: ReturnType<typeof setInterval> | null = null
 let latestAgentStatus = 'Starting...'
 
 // Ensure unique app identity in dev mode to avoid collisions with generic Electron apps.
@@ -912,6 +913,28 @@ function clearExtensionAutoReconnectTimer() {
     }
 }
 
+function stopExtensionWatchdog() {
+    if (extensionWatchdogTimer) {
+        clearInterval(extensionWatchdogTimer)
+        extensionWatchdogTimer = null
+    }
+}
+
+function startExtensionWatchdog() {
+    if (extensionWatchdogTimer) return
+    extensionWatchdogTimer = setInterval(() => {
+        if (appQuitting || licenseRevokedLockdown) return
+        void (async () => {
+            const ready = await probeExtensionRuntimeReady()
+            if (ready) {
+                extensionAutoReconnectAttempts = 0
+                return
+            }
+            scheduleExtensionAutoReconnect('watchdog', 200)
+        })()
+    }, 10000)
+}
+
 async function performExtensionReconnect(): Promise<ExtensionReconnectResult> {
     try {
         // Ensure Flow window (and extension side panel) is alive.
@@ -1069,6 +1092,7 @@ async function enforceLicenseRevocation(source: 'startup' | 'poll'): Promise<voi
             }
             licenseRevokedLockdown = true
             clearExtensionAutoReconnectTimer()
+            stopExtensionWatchdog()
             extensionAutoReconnectAttempts = 0
             sidecar.stop()
 
@@ -1093,6 +1117,7 @@ async function enforceLicenseRevocation(source: 'startup' | 'poll'): Promise<voi
             console.log('[license] Device re-activated. Resuming sidecar.')
             licenseRevokedLockdown = false
             extensionAutoReconnectAttempts = 0
+            startExtensionWatchdog()
             sidecar.start()
         }
         licenseRevokedNotified = false
@@ -1410,6 +1435,7 @@ app.whenReady().then(async () => {
         setAgentStatus(status)
         if (status === 'Ready' && !licenseRevokedLockdown) {
             scheduleExtensionAutoReconnect('sidecar-ready', 500)
+            startExtensionWatchdog()
         }
     })
 
@@ -1450,6 +1476,7 @@ app.on('before-quit', () => {
     appQuitting = true
     stopLicenseEnforcer()
     clearExtensionAutoReconnectTimer()
+    stopExtensionWatchdog()
     sidecar.stop()
 })
 

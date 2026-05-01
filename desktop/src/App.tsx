@@ -92,14 +92,40 @@ function AgentStatusBadge() {
     const [status, setStatus] = useState('Đang khởi động...')
 
     useEffect(() => {
+        let mounted = true
         window.electron?.getAgentStatus?.()
             .then((value) => {
+                if (!mounted) return
                 if (value) setStatus(value)
             })
             .catch(() => { })
+
+        const fallback = setInterval(() => {
+            window.electron?.getHealth?.()
+                .then((health: any) => {
+                    if (!mounted) return
+                    if (!health || health.status !== 'ok') return
+                    setStatus((prev) => (
+                        prev === 'Đang khởi động...' || prev === 'Starting...'
+                            ? 'Ready'
+                            : prev
+                    ))
+                })
+                .catch(() => { })
+        }, 5000)
+
         if (window.electron?.onAgentStatus) {
             const unsub = window.electron.onAgentStatus(setStatus)
-            return unsub
+            return () => {
+                mounted = false
+                clearInterval(fallback)
+                unsub()
+            }
+        }
+
+        return () => {
+            mounted = false
+            clearInterval(fallback)
         }
     }, [])
 
