@@ -350,64 +350,8 @@ def _is_model_access_denied(result: dict) -> bool:
     return (
         "public_error_model_access_denied" in text
         or "model_access_denied" in text
-        or "permission denied" in text
-        or "access denied" in text
         or "does not have permission" in text
     )
-
-
-def _is_captcha_or_safety_forbidden(result: dict) -> bool:
-    status = result.get("status")
-    if not (isinstance(status, int) and status == 403):
-        return False
-    text = _extract_error_text(result).lower()
-    return (
-        "captcha" in text
-        or "recaptcha" in text
-        or "too_much_traffic" in text
-        or "public_error_unusual_activity_too_much_traffic" in text
-        or "public_error_unsafe_generation" in text
-    )
-
-
-def _is_retryable_forbidden(result: dict) -> bool:
-    """True when 403 likely comes from model/account auth constraints, not captcha."""
-    status = result.get("status")
-    if not (isinstance(status, int) and status == 403):
-        return False
-    if _is_captcha_or_safety_forbidden(result):
-        return False
-    text = _extract_error_text(result).lower()
-    return (
-        _is_model_access_denied(result)
-        or "credentials_missing" in text
-        or "expected oauth2 access token" in text
-        or "api keys are not supported by this api" in text
-        or "forbidden" in text
-        or not text
-    )
-
-
-def _resolve_image_model_candidates(
-    *,
-    requested_model_key: str | None = None,
-) -> list[tuple[str, str]]:
-    """Return ordered, deduplicated image model candidates."""
-    candidates: list[tuple[str, str]] = []
-    if requested_model_key:
-        candidates.append(("requested", requested_model_key))
-
-    for alias, model_key in (IMAGE_MODELS or {}).items():
-        if isinstance(model_key, str) and model_key.strip():
-            candidates.append((f"config:{alias}", model_key.strip()))
-
-    seen: set[str] = set()
-    deduped: list[tuple[str, str]] = []
-    for source, model_key in candidates:
-        if model_key not in seen:
-            seen.add(model_key)
-            deduped.append((source, model_key))
-    return deduped
 
 
 def _model_key_variants(model_key: str) -> list[str]:
@@ -514,9 +458,7 @@ class FlowClient:
         self._extension_ws = None  # Set by WS server when extension connects
         self._extension_ws_pool: set = set()
         self._extension_ws_order: dict[object, int] = {}
-        self._ws_runtime_instance: dict[object, str] = {}
         self._extension_ws_seq = 0
-        self._preferred_runtime_instance_id: str = ""
         self._pending: dict[str, asyncio.Future] = {}
         self._flow_key: Optional[str] = None
         self._sync_in_progress = False
@@ -535,22 +477,6 @@ class FlowClient:
         self._ws_last_disconnect_at: Optional[float] = None
         # Guard against pull_project_urls spam when UI retries many broken media at once.
         self._project_pull_cooldown_until: dict[str, float] = {}
-
-    @staticmethod
-    def _normalize_runtime_instance_id(value: object) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        return text[:128]
-
-    def set_preferred_runtime_instance_id(self, runtime_instance_id: str | None) -> str:
-        normalized = self._normalize_runtime_instance_id(runtime_instance_id)
-        self._preferred_runtime_instance_id = normalized
-        if normalized:
-            logger.info("Preferred extension runtime set: %s", normalized)
-        else:
-            logger.info("Preferred extension runtime cleared")
-        return normalized
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
@@ -590,20 +516,8 @@ class FlowClient:
             if getattr(ws, "closed", False):
                 self._extension_ws_pool.discard(ws)
                 self._extension_ws_order.pop(ws, None)
-                self._ws_runtime_instance.pop(ws, None)
                 continue
             live.append(ws)
-
-        preferred = self._preferred_runtime_instance_id
-        if preferred:
-            preferred_ws = [
-                ws for ws in live
-                if self._normalize_runtime_instance_id(self._ws_runtime_instance.get(ws, "")) == preferred
-            ]
-            if preferred_ws:
-                others = [ws for ws in live if ws not in preferred_ws]
-                return preferred_ws + others
-
         if self._extension_ws in live:
             live.remove(self._extension_ws)
             live.insert(0, self._extension_ws)
@@ -618,7 +532,6 @@ class FlowClient:
         if ws is not None:
             self._extension_ws_pool.discard(ws)
             self._extension_ws_order.pop(ws, None)
-            self._ws_runtime_instance.pop(ws, None)
             if self._extension_ws is ws:
                 self._extension_ws = self._choose_live_ws()
             elif self._extension_ws is None:
@@ -626,7 +539,6 @@ class FlowClient:
         else:
             self._extension_ws_pool.clear()
             self._extension_ws_order.clear()
-            self._ws_runtime_instance.clear()
             self._extension_ws = None
 
         self._ws_disconnect_count += 1
@@ -672,7 +584,7 @@ class FlowClient:
             "uptime_s": uptime,
         }
 
-    async def handle_message(self, data: dict, ws=None):
+    async def handle_message(self, data: dict):
         """Handle incoming message from extension."""
         if data.get("type") == "token_captured":
             new_key = str(data.get("flowKey") or "").strip()
@@ -689,9 +601,6 @@ class FlowClient:
 
         if data.get("type") == "extension_ready":
             logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
-            runtime_id = self._normalize_runtime_instance_id(data.get("runtimeInstanceId"))
-            if runtime_id and ws is not None:
-                self._ws_runtime_instance[ws] = runtime_id
             # Avoid redundant credits checks on each worker reconnect.
             self._queue_tier_sync(reason="extension_ready")
             return
@@ -705,9 +614,8 @@ class FlowClient:
 
         if data.get("type") == "ping":
             # Respond to keepalive
-            target = ws or self._extension_ws
-            if target:
-                await target.send(json.dumps({"type": "pong"}))
+            if self._extension_ws:
+                await self._extension_ws.send(json.dumps({"type": "pong"}))
             return
 
         # Response to a pending request
@@ -1798,26 +1706,6 @@ class FlowClient:
         ws_candidates = self._live_ws_candidates()
         if not ws_candidates:
             return {"error": "Extension not connected"}
-        preferred_runtime = self._preferred_runtime_instance_id
-        preferred_candidates = []
-        if preferred_runtime:
-            preferred_candidates = [
-                ws for ws in ws_candidates
-                if self._normalize_runtime_instance_id(self._ws_runtime_instance.get(ws, "")) == preferred_runtime
-            ]
-        has_preferred_candidate = bool(preferred_candidates)
-        strict_preferred_methods = {
-            "api_request",
-            "trpc_request",
-            "pull_project_urls",
-            "solve_captcha",
-            "refresh_token",
-        }
-        if preferred_runtime and method in strict_preferred_methods:
-            if not has_preferred_candidate:
-                return {"error": f"Preferred extension runtime not connected ({preferred_runtime})"}
-            # Keep runtime routing deterministic once panel has bound a preferred runtime.
-            ws_candidates = preferred_candidates
 
         def _prefer_another_ws(result: dict, attempt_index: int) -> bool:
             if attempt_index >= len(ws_candidates) - 1:
@@ -1831,30 +1719,6 @@ class FlowClient:
                 if not isinstance(raw_data, dict):
                     raw_data = result.get("result")
                 data = raw_data if isinstance(raw_data, dict) else {}
-                state = str(data.get("state") or "").lower()
-                agent_connected = bool(
-                    data.get("agentConnected", data.get("connected", False))
-                )
-                runtime_id = self._normalize_runtime_instance_id(
-                    data.get("runtimeInstanceId") or data.get("runtime_instance_id")
-                )
-                if runtime_id:
-                    self._ws_runtime_instance[ws_candidates[attempt_index]] = runtime_id
-
-                if (
-                    has_preferred_candidate
-                    and preferred_runtime
-                    and runtime_id
-                    and runtime_id != preferred_runtime
-                ):
-                    return True
-
-                # When multiple extension workers exist (multi-session/account),
-                # the first responder can be an OFF worker. Prefer trying another
-                # candidate to find the live runtime worker.
-                if state == "off" or not agent_connected:
-                    return True
-
                 has_runtime_fields = any(
                     key in data
                     for key in (
@@ -1897,16 +1761,6 @@ class FlowClient:
                     "params": params,
                 }))
                 result = await asyncio.wait_for(future, timeout=timeout)
-                if method == "get_status":
-                    raw_data = result.get("data")
-                    if not isinstance(raw_data, dict):
-                        raw_data = result.get("result")
-                    data = raw_data if isinstance(raw_data, dict) else {}
-                    runtime_id = self._normalize_runtime_instance_id(
-                        data.get("runtimeInstanceId") or data.get("runtime_instance_id")
-                    )
-                    if runtime_id:
-                        self._ws_runtime_instance[ws] = runtime_id
                 last_error = result
                 if _prefer_another_ws(result, idx):
                     logger.info(
@@ -1978,62 +1832,43 @@ class FlowClient:
         Response structure:
             data.media[].name = mediaId (used for video gen)
         """
+        ts = int(time.time() * 1000)
         ctx = self._client_context(project_id, user_paygate_tier)
-        candidates = _resolve_image_model_candidates(requested_model_key=image_model_key)
-        if not candidates:
-            return {"error": "No image model candidates available"}
+
+        selected_image_model = image_model_key or IMAGE_MODELS["NANO_BANANA_PRO"]
+
+        request_item = {
+            "clientContext": {**ctx, "sessionId": f";{ts}"},
+            "seed": ts % 1000000,
+            "structuredPrompt": {"parts": [{"text": prompt}]},
+            "imageAspectRatio": aspect_ratio,
+            "imageModelName": selected_image_model,
+        }
+
+        # Add character references if provided (edit_image flow)
+        if character_media_ids:
+            request_item["imageInputs"] = [
+                {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
+                for mid in character_media_ids
+            ]
+
+        batch_id = f"{uuid.uuid4()}" if character_media_ids else None
+        body = {
+            "clientContext": ctx,
+            "requests": [request_item],
+        }
+        if batch_id:
+            body["mediaGenerationContext"] = {"batchId": batch_id}
+            body["useNewMedia"] = True
 
         url = self._build_url("generate_images", project_id=project_id)
-        last_result: dict | None = None
-
-        for idx, (source, selected_image_model) in enumerate(candidates):
-            ts = int(time.time() * 1000)
-            request_item = {
-                "clientContext": {**ctx, "sessionId": f";{ts}"},
-                "seed": ts % 1000000,
-                "structuredPrompt": {"parts": [{"text": prompt}]},
-                "imageAspectRatio": aspect_ratio,
-                "imageModelName": selected_image_model,
-            }
-
-            # Add character references if provided (edit-image style generation)
-            if character_media_ids:
-                request_item["imageInputs"] = [
-                    {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
-                    for mid in character_media_ids
-                ]
-
-            batch_id = f"{uuid.uuid4()}" if character_media_ids else None
-            body = {
-                "clientContext": ctx,
-                "requests": [request_item],
-            }
-            if batch_id:
-                body["mediaGenerationContext"] = {"batchId": batch_id}
-                body["useNewMedia"] = True
-
-            result = await self._send("api_request", {
-                "url": url,
-                "method": "POST",
-                "headers": random_headers(),
-                "body": body,
-                "captchaAction": "IMAGE_GENERATION",
-            })
-            last_result = result
-
-            if not _is_retryable_forbidden(result):
-                if idx > 0:
-                    logger.info("generate_images recovered with fallback model=%s", selected_image_model)
-                return result
-
-            logger.warning(
-                "generate_images forbidden for model=%s (%s): %s",
-                selected_image_model,
-                source,
-                _extract_error_text(result),
-            )
-
-        return last_result or {"error": "Image generation failed with all model candidates"}
+        return await self._send("api_request", {
+            "url": url,
+            "method": "POST",
+            "headers": random_headers(),
+            "body": body,
+            "captchaAction": "IMAGE_GENERATION",
+        })
 
     async def edit_image(self, prompt: str, source_media_id: str,
                           project_id: str,
@@ -2047,6 +1882,7 @@ class FlowClient:
         after the base image. Order: [base_image, char_A, char_B, ...].
         This helps Google Flow detect characters for consistent edits.
         """
+        ts = int(time.time() * 1000)
         ctx = self._client_context(project_id, user_paygate_tier)
 
         image_inputs = [
@@ -2056,53 +1892,32 @@ class FlowClient:
             for mid in character_media_ids:
                 image_inputs.append({"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"})
 
-        candidates = _resolve_image_model_candidates(requested_model_key=image_model_key)
-        if not candidates:
-            return {"error": "No image model candidates available"}
+        selected_image_model = image_model_key or IMAGE_MODELS["NANO_BANANA_PRO"]
+
+        request_item = {
+            "clientContext": {**ctx, "sessionId": f";{ts}"},
+            "seed": ts % 1000000,
+            "structuredPrompt": {"parts": [{"text": prompt}]},
+            "imageAspectRatio": aspect_ratio,
+            "imageModelName": selected_image_model,
+            "imageInputs": image_inputs,
+        }
+
+        body = {
+            "clientContext": ctx,
+            "mediaGenerationContext": {"batchId": f"{uuid.uuid4()}"},
+            "useNewMedia": True,
+            "requests": [request_item],
+        }
 
         url = self._build_url("generate_images", project_id=project_id)
-        last_result: dict | None = None
-
-        for idx, (source, selected_image_model) in enumerate(candidates):
-            ts = int(time.time() * 1000)
-            request_item = {
-                "clientContext": {**ctx, "sessionId": f";{ts}"},
-                "seed": ts % 1000000,
-                "structuredPrompt": {"parts": [{"text": prompt}]},
-                "imageAspectRatio": aspect_ratio,
-                "imageModelName": selected_image_model,
-                "imageInputs": image_inputs,
-            }
-
-            body = {
-                "clientContext": ctx,
-                "mediaGenerationContext": {"batchId": f"{uuid.uuid4()}"},
-                "useNewMedia": True,
-                "requests": [request_item],
-            }
-
-            result = await self._send("api_request", {
-                "url": url,
-                "method": "POST",
-                "headers": random_headers(),
-                "body": body,
-                "captchaAction": "IMAGE_GENERATION",
-            })
-            last_result = result
-
-            if not _is_retryable_forbidden(result):
-                if idx > 0:
-                    logger.info("edit_image recovered with fallback model=%s", selected_image_model)
-                return result
-
-            logger.warning(
-                "edit_image forbidden for model=%s (%s): %s",
-                selected_image_model,
-                source,
-                _extract_error_text(result),
-            )
-
-        return last_result or {"error": "Edit image failed with all model candidates"}
+        return await self._send("api_request", {
+            "url": url,
+            "method": "POST",
+            "headers": random_headers(),
+            "body": body,
+            "captchaAction": "IMAGE_GENERATION",
+        })
 
     async def generate_video(self, start_image_media_id: str, prompt: str,
                               project_id: str, scene_id: str,
@@ -2372,7 +2187,6 @@ class FlowClient:
                 "state": "off",
                 "manual_disconnect": False,
                 "runtime_connected": False,
-                "preferred_runtime_instance_id": self._preferred_runtime_instance_id or None,
                 "token_auth_state": "unknown",
                 "token_auth_checked_at": None,
                 "token_auth_error": None,
@@ -2387,7 +2201,6 @@ class FlowClient:
                 "state": "off",
                 "manual_disconnect": False,
                 "runtime_connected": False,
-                "preferred_runtime_instance_id": self._preferred_runtime_instance_id or None,
                 "error": _extract_error_text(result) or "STATUS_UNAVAILABLE",
                 "token_auth_state": "unknown",
                 "token_auth_checked_at": None,
@@ -2408,17 +2221,6 @@ class FlowClient:
         manual_disconnect = bool(data.get("manualDisconnect", False))
         flow_key_present = bool(data.get("flowKeyPresent", self._flow_key))
         runtime_connected = agent_connected and not manual_disconnect and state != "off"
-        runtime_instance_id = self._normalize_runtime_instance_id(
-            data.get("runtimeInstanceId") or data.get("runtime_instance_id")
-        )
-        if runtime_instance_id and self._extension_ws is not None:
-            self._ws_runtime_instance[self._extension_ws] = runtime_instance_id
-        preferred_runtime = self._preferred_runtime_instance_id
-        preferred_runtime_mismatch = bool(
-            preferred_runtime and runtime_instance_id and runtime_instance_id != preferred_runtime
-        )
-        if preferred_runtime_mismatch:
-            runtime_connected = False
         return {
             "connected": self.connected,
             "agent_connected": agent_connected,
@@ -2426,9 +2228,6 @@ class FlowClient:
             "state": state,
             "manual_disconnect": manual_disconnect,
             "runtime_connected": runtime_connected,
-            "runtime_instance_id": runtime_instance_id or None,
-            "preferred_runtime_instance_id": preferred_runtime or None,
-            "preferred_runtime_mismatch": preferred_runtime_mismatch,
             "flow_tab_id": data.get("flowTabId"),
             "flow_tab_url": data.get("flowTabUrl"),
             "flow_tab_seen_at": data.get("flowTabSeenAt"),

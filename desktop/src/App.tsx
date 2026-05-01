@@ -1,4 +1,4 @@
-import { HashRouter, NavLink, Routes, Route, useLocation } from 'react-router-dom'
+import { BrowserRouter, NavLink, Routes, Route, useLocation } from 'react-router-dom'
 import {
     LayoutDashboard,
     FolderOpen,
@@ -92,40 +92,9 @@ function AgentStatusBadge() {
     const [status, setStatus] = useState('Đang khởi động...')
 
     useEffect(() => {
-        let mounted = true
-        window.electron?.getAgentStatus?.()
-            .then((value) => {
-                if (!mounted) return
-                if (value) setStatus(value)
-            })
-            .catch(() => { })
-
-        const fallback = setInterval(() => {
-            window.electron?.getHealth?.()
-                .then((health: any) => {
-                    if (!mounted) return
-                    if (!health || health.status !== 'ok') return
-                    setStatus((prev) => (
-                        prev === 'Đang khởi động...' || prev === 'Starting...'
-                            ? 'Ready'
-                            : prev
-                    ))
-                })
-                .catch(() => { })
-        }, 5000)
-
         if (window.electron?.onAgentStatus) {
             const unsub = window.electron.onAgentStatus(setStatus)
-            return () => {
-                mounted = false
-                clearInterval(fallback)
-                unsub()
-            }
-        }
-
-        return () => {
-            mounted = false
-            clearInterval(fallback)
+            return unsub
         }
     }, [])
 
@@ -576,9 +545,9 @@ export default function App() {
         <div className="h-full w-full flex flex-col">
             <AppWindowHeader />
             <div className="flex-1 min-h-0">
-                <HashRouter>
+                <BrowserRouter>
                     <Layout />
-                </HashRouter>
+                </BrowserRouter>
             </div>
         </div>
     )

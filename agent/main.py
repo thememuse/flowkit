@@ -9,7 +9,7 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.config import API_HOST, API_PORT, WS_HOST, WS_PORT, WS_PORT_CANDIDATES
+from agent.config import API_HOST, API_PORT, WS_HOST, WS_PORT
 from agent.db.schema import init_db, close_db
 from agent.api.characters import router as characters_router
 from agent.api.projects import router as projects_router
@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 # ─── WebSocket Server for Extension ─────────────────────────
 _ws_listener_active = False
-_ws_listener_port: int | None = None
 
 async def ws_handler(websocket):
     """Handle a Chrome extension WebSocket connection."""
@@ -51,7 +50,7 @@ async def ws_handler(websocket):
         async for raw in websocket:
             try:
                 data = json.loads(raw)
-                await client.handle_message(data, websocket)
+                await client.handle_message(data)
             except json.JSONDecodeError:
                 logger.warning("Invalid JSON from extension")
             except Exception as e:
@@ -69,45 +68,21 @@ async def run_ws_server():
     Keep retrying so temporary bind/runtime errors don't leave the extension
     permanently disconnected while API server is still alive.
     """
-    global _ws_listener_active, _ws_listener_port
+    global _ws_listener_active
     retry_delay_sec = 2
     while True:
-        bound = False
-        for candidate_port in WS_PORT_CANDIDATES:
-            try:
-                async with websockets.serve(ws_handler, WS_HOST, candidate_port):
-                    _ws_listener_active = True
-                    _ws_listener_port = candidate_port
-                    logger.info("WebSocket server listening on ws://%s:%d", WS_HOST, candidate_port)
-                    bound = True
-                    await asyncio.Future()  # run forever until cancelled
-            except asyncio.CancelledError:
-                _ws_listener_active = False
-                _ws_listener_port = None
-                raise
-            except OSError as e:
-                msg = str(e).lower()
-                if "address already in use" in msg or "10048" in msg:
-                    logger.warning(
-                        "WS port %d busy, trying next candidate. candidates=%s",
-                        candidate_port,
-                        WS_PORT_CANDIDATES,
-                    )
-                    continue
-                logger.exception("WS bind error on port %d: %s", candidate_port, e)
-            except Exception as e:
-                logger.exception("WS server crashed on port %d (%s)", candidate_port, e)
-
+        try:
+            async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
+                _ws_listener_active = True
+                logger.info("WebSocket server listening on ws://%s:%d", WS_HOST, WS_PORT)
+                await asyncio.Future()  # run forever until cancelled
+        except asyncio.CancelledError:
             _ws_listener_active = False
-            _ws_listener_port = None
-
-        if not bound:
-            logger.error(
-                "WS server unavailable: all candidate ports busy/failed (%s). Retrying in %ss",
-                WS_PORT_CANDIDATES,
-                retry_delay_sec,
-            )
-        await asyncio.sleep(retry_delay_sec)
+            raise
+        except Exception as e:
+            _ws_listener_active = False
+            logger.exception("WS server crashed (%s). Retrying in %ss", e, retry_delay_sec)
+            await asyncio.sleep(retry_delay_sec)
 
 
 # ─── FastAPI App ─────────────────────────────────────────────
@@ -239,8 +214,6 @@ async def health():
         "extension_state": ext_status.get("state"),
         "extension_manual_disconnect": ext_status.get("manual_disconnect"),
         "ws_server_listening": _ws_listener_active,
-        "ws_server_port": _ws_listener_port,
-        "ws_server_candidates": WS_PORT_CANDIDATES,
         "ws": client.ws_stats,
     }
 

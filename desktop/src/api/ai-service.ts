@@ -1,10 +1,10 @@
 /**
  * Unified AI Provider Service
- * Supports Gemini, Claude (Anthropic), and OpenAI with per-provider key management
+ * Supports Gemini, Claude (Anthropic), OpenAI, and DeepSeek with per-provider key management
  * and automatic key rotation on quota limits (429 / 503)
  */
 
-export type ProviderType = 'gemini' | 'claude' | 'openai'
+export type ProviderType = 'gemini' | 'claude' | 'openai' | 'deepseek'
 
 export interface APIKey {
     id: string
@@ -19,6 +19,7 @@ export interface GeneralSettings {
     defaultLanguage: string
     defaultMaterial: string
     exportRootDir: string
+    deepseekModel: string
 }
 
 // ─── localStorage helpers ──────────────────────────────────────
@@ -97,7 +98,7 @@ function parseJsonLoose<T>(raw: string): T {
 
 function normalizeProvider(value: unknown, fallback: ProviderType = 'gemini'): ProviderType {
     const raw = String(value ?? '').trim().toLowerCase()
-    if (raw === 'gemini' || raw === 'claude' || raw === 'openai') return raw
+    if (raw === 'gemini' || raw === 'claude' || raw === 'openai' || raw === 'deepseek') return raw
     return fallback
 }
 
@@ -192,7 +193,10 @@ function normalizeKeyList(rawItems: unknown[]): APIKey[] {
 }
 
 function providerName(provider: ProviderType): string {
-    return provider === 'gemini' ? 'Gemini' : provider === 'claude' ? 'Claude' : 'OpenAI'
+    if (provider === 'gemini') return 'Gemini'
+    if (provider === 'claude') return 'Claude'
+    if (provider === 'deepseek') return 'DeepSeek'
+    return 'OpenAI'
 }
 
 function isInvalidKeyResponse(status: number, bodyText: string): boolean {
@@ -244,9 +248,16 @@ export function loadGeneralSettings(): GeneralSettings {
             defaultLanguage: typeof raw.defaultLanguage === 'string' && raw.defaultLanguage.trim() ? raw.defaultLanguage : 'vi',
             defaultMaterial: typeof raw.defaultMaterial === 'string' && raw.defaultMaterial.trim() ? raw.defaultMaterial : 'realistic',
             exportRootDir: typeof raw.exportRootDir === 'string' ? raw.exportRootDir.trim() : '',
+            deepseekModel: typeof raw.deepseekModel === 'string' && raw.deepseekModel.trim() ? raw.deepseekModel.trim() : 'deepseek-chat',
         }
     } catch {
-        return { defaultProvider: 'gemini', defaultLanguage: 'vi', defaultMaterial: 'realistic', exportRootDir: '' }
+        return {
+            defaultProvider: 'gemini',
+            defaultLanguage: 'vi',
+            defaultMaterial: 'realistic',
+            exportRootDir: '',
+            deepseekModel: 'deepseek-chat',
+        }
     }
 }
 
@@ -258,6 +269,9 @@ export function saveGeneralSettings(s: Partial<GeneralSettings>) {
         defaultLanguage: merged.defaultLanguage || current.defaultLanguage,
         defaultMaterial: merged.defaultMaterial || current.defaultMaterial,
         exportRootDir: typeof merged.exportRootDir === 'string' ? merged.exportRootDir.trim() : current.exportRootDir,
+        deepseekModel: typeof merged.deepseekModel === 'string' && merged.deepseekModel.trim()
+            ? merged.deepseekModel.trim()
+            : current.deepseekModel,
     }))
 }
 
@@ -314,11 +328,30 @@ async function callOpenAI(key: string, prompt: string, systemPrompt?: string, ti
     })
 }
 
+async function callDeepSeek(key: string, prompt: string, systemPrompt?: string, timeoutMs?: number): Promise<Response> {
+    const deepseekModel = loadGeneralSettings().deepseekModel || 'deepseek-chat'
+    return fetch('https://api.deepseek.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+            model: deepseekModel,
+            response_format: { type: 'json_object' },
+            temperature: 0.3,
+            max_tokens: 4096,
+            messages: [
+                ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+                { role: 'user', content: prompt },
+            ],
+        }),
+        signal: timeoutSignal(timeoutMs),
+    })
+}
+
 async function parseResponse(res: Response, provider: ProviderType): Promise<string> {
     const data = await res.json()
     if (provider === 'gemini') return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}'
     if (provider === 'claude') return data.content?.[0]?.text ?? '{}'
-    if (provider === 'openai') return data.choices?.[0]?.message?.content ?? '{}'
+    if (provider === 'openai' || provider === 'deepseek') return data.choices?.[0]?.message?.content ?? '{}'
     return '{}'
 }
 
@@ -343,7 +376,10 @@ export async function aiGenerate<T = unknown>(
     }
 
     const callers: Record<ProviderType, typeof callGemini> = {
-        gemini: callGemini, claude: callClaude, openai: callOpenAI,
+        gemini: callGemini,
+        claude: callClaude,
+        openai: callOpenAI,
+        deepseek: callDeepSeek,
     }
 
     let lastError: Error | null = null

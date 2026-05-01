@@ -1,0 +1,10 @@
+{
+  "preparedAt": "2026-04-29T12:50:08.863Z",
+  "targetPlatform": "win32",
+  "specSignature": "{\"targetPlatform\":\"win32\",\"ffmpegZipUrls\":[\"https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip\",\"https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip\"],\"ffprobeZipUrls\":null,\"realesrganZipUrls\":[\"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.3.0/realesrgan-ncnn-windows.zip\",\"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip\"]}",
+  "runtimeRoot": "/Volumes/DATA/Apps/FlowKit/desktop/resources/agent/third_party/win32",
+  "ffmpegBin": "ffmpeg/ffmpeg.exe",
+  "ffprobeBin": "ffmpeg/ffprobe.exe",
+  "realesrganBin": "realesrgan/realesrgan-ncnn-vulkan.exe",
+  "modelDir": "realesrgan/models"
+}

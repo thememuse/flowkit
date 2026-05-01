@@ -125,10 +125,6 @@ class ManualVideoBatchRequest(BaseModel):
     items: list[ManualVideoItem] = Field(default_factory=list)
 
 
-class PreferredRuntimeRequest(BaseModel):
-    runtime_instance_id: Optional[str] = None
-
-
 def _extract_first_url(payload: Any) -> str | None:
     def _is_direct_media_url(url: str) -> bool:
         low = (url or "").lower()
@@ -388,19 +384,6 @@ async def extension_status():
     client = get_flow_client()
     status = await client.get_extension_status()
     return status
-
-
-@router.post("/preferred-runtime")
-async def set_preferred_runtime(body: PreferredRuntimeRequest):
-    """Pin FlowClient to the runtime instance currently active in side panel."""
-    client = get_flow_client()
-    preferred = client.set_preferred_runtime_instance_id(body.runtime_instance_id)
-    status = await client.get_extension_status()
-    return {
-        "ok": True,
-        "preferred_runtime_instance_id": preferred or None,
-        "status": status,
-    }
 
 
 @router.get("/local-media")

@@ -56,7 +56,6 @@ export interface ElectronAPI {
     setLicenseConfig: (apiBaseUrl: string) => Promise<{ apiBaseUrl: string }>
     getLicenseStatus: (force?: boolean) => Promise<LicenseCheckResult>
     getHealth: () => Promise<{ status: string; extension_connected: boolean; version?: string }>
-    getAgentStatus: () => Promise<string>
     reconnectExtension: () => Promise<{ ok: boolean; method?: string; error?: string }>
     pickImageFile: () => Promise<string | null>
     pickFile: (kind?: 'image' | 'audio' | 'video' | 'any') => Promise<string | null>

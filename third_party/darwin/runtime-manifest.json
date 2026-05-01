@@ -1,0 +1,10 @@
+{
+  "preparedAt": "2026-04-29T04:33:55.014Z",
+  "targetPlatform": "darwin",
+  "specSignature": "{\"targetPlatform\":\"darwin\",\"ffmpegZipUrls\":[\"https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip\"],\"ffprobeZipUrls\":[\"https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip\"],\"realesrganZipUrls\":[\"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.3.0/realesrgan-ncnn-macos.zip\",\"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-macos.zip\"]}",
+  "runtimeRoot": "/Volumes/DATA/Apps/FlowKit/desktop/resources/agent/third_party/darwin",
+  "ffmpegBin": "ffmpeg/ffmpeg",
+  "ffprobeBin": "ffmpeg/ffprobe",
+  "realesrganBin": "realesrgan/realesrgan-ncnn-vulkan",
+  "modelDir": "realesrgan/models"
+}

@@ -15,34 +15,6 @@ API_PORT = int(os.environ.get("API_PORT", "8100"))
 WS_HOST = os.environ.get("WS_HOST", "127.0.0.1")
 WS_PORT = int(os.environ.get("WS_PORT", "9222"))
 
-
-def _parse_ws_port_candidates() -> list[int]:
-    raw = os.environ.get("WS_PORT_CANDIDATES", "").strip()
-    ports: list[int] = []
-    if raw:
-        for chunk in raw.split(","):
-            token = chunk.strip()
-            if not token:
-                continue
-            try:
-                port = int(token)
-            except ValueError:
-                continue
-            if 1 <= port <= 65535 and port not in ports:
-                ports.append(port)
-
-    if WS_PORT not in ports:
-        ports.insert(0, WS_PORT)
-
-    for fallback in (19222, 29222):
-        if fallback not in ports:
-            ports.append(fallback)
-
-    return ports
-
-
-WS_PORT_CANDIDATES = _parse_ws_port_candidates()
-
 # ─── Google Flow API ────────────────────────────────────────
 GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY")

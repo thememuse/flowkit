@@ -607,6 +607,18 @@ Each channel has a rules file controlling upload scheduling and SEO:
 
 Upload validation checks: max per day, min gap between uploads, avoid dead hours. Auto-detects Short (<61s + vertical 9:16) vs Long-form.
 
+## Desktop License Activation (Commercial)
+
+FlowKit desktop now supports machine-bound activation:
+
+- app shows a stable `Machine ID` at startup
+- only devices activated in CMS can use the app
+- plans supported: `1M`, `3M`, `6M`, `1Y`, `LIFE`
+
+Deployment + CMS guide:
+
+- [docs/license-cloudflare.md](docs/license-cloudflare.md)
+
 ## Troubleshooting
 
 | Problem | Solution |

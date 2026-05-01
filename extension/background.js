@@ -5,10 +5,7 @@
  * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-const AGENT_HTTP_BASE = "http://127.0.0.1:8100";
-const DEFAULT_AGENT_WS_PORT = 9222;
-const DEFAULT_AGENT_WS_URL = `ws://127.0.0.1:${DEFAULT_AGENT_WS_PORT}`;
-let AGENT_WS_URL = DEFAULT_AGENT_WS_URL;
+const AGENT_WS_URL = "ws://127.0.0.1:9222";
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY";
 
@@ -19,7 +16,6 @@ let state = "off"; // off | idle | running
 let manualDisconnect = false;
 let initialized = false;
 let keepAlivePortCount = 0;
-let runtimeInstanceId = "";
 let lastFlowTabId = null;
 let lastFlowTabUrl = "";
 let lastFlowSeenAt = 0;
@@ -39,7 +35,6 @@ const MAX_MEDIA_CACHE_SIZE = 2500;
 const MEDIA_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MEDIA_URL_MIN_REMAINING_MS = 90 * 1000;
 const MEDIA_CACHE_STORAGE_KEY = "mediaUrlCacheV1";
-const RUNTIME_INSTANCE_STORAGE_KEY = "runtimeInstanceIdV1";
 const MEDIA_CACHE_FLUSH_DELAY_MS = 450;
 const TOKEN_CAPTURE_REBROADCAST_MS = 120000;
 const mediaUrlCache = new Map();
@@ -48,75 +43,6 @@ let mediaCacheSaveTimer = null;
 let mediaForwardTimer = null;
 let lastTokenBroadcastValue = "";
 let lastTokenBroadcastAt = 0;
-
-function buildRuntimeInstanceId() {
-  try {
-    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  } catch (_) {
-    // fallback below
-  }
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `rt-${Date.now().toString(36)}-${rand}`;
-}
-
-async function ensureRuntimeInstanceId() {
-  if (runtimeInstanceId) return runtimeInstanceId;
-  try {
-    const data = await chrome.storage.local.get([RUNTIME_INSTANCE_STORAGE_KEY]);
-    const persisted = String(data?.[RUNTIME_INSTANCE_STORAGE_KEY] || "").trim();
-    if (persisted) {
-      runtimeInstanceId = persisted;
-      return runtimeInstanceId;
-    }
-  } catch (_) {
-    // fallback below
-  }
-  runtimeInstanceId = buildRuntimeInstanceId();
-  try {
-    await chrome.storage.local.set({ [RUNTIME_INSTANCE_STORAGE_KEY]: runtimeInstanceId });
-  } catch (_) {
-    // ignore storage write failures
-  }
-  return runtimeInstanceId;
-}
-
-function _safePort(value, fallback = DEFAULT_AGENT_WS_PORT) {
-  const port = Number(value);
-  if (!Number.isFinite(port)) return fallback;
-  if (port < 1 || port > 65535) return fallback;
-  return Math.trunc(port);
-}
-
-function _wsUrlForPort(port) {
-  return `ws://127.0.0.1:${_safePort(port)}`;
-}
-
-async function resolveAgentWsUrl() {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1200);
-  try {
-    const res = await fetch(`${AGENT_HTTP_BASE}/health`, {
-      method: "GET",
-      cache: "no-store",
-      signal: controller.signal,
-    });
-    if (!res.ok) return AGENT_WS_URL;
-    const body = await res.json().catch(() => ({}));
-    const port = _safePort(
-      body?.ws_server_port ?? body?.ws_port ?? DEFAULT_AGENT_WS_PORT,
-    );
-    const next = _wsUrlForPort(port);
-    if (next !== AGENT_WS_URL) {
-      AGENT_WS_URL = next;
-      console.log("[FlowAgent] Using dynamic WS URL:", AGENT_WS_URL);
-    }
-    return AGENT_WS_URL;
-  } catch {
-    return AGENT_WS_URL;
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // ─── URL → Log Type Classifier ─────────────────────────────
 
@@ -495,7 +421,7 @@ function setTokenAuthState(nextState, error = null) {
 
 function isAuthFailureResponse(status, responseText = "") {
   if (status === 401) return true;
-  if (status !== 400 && status !== 403) return false;
+  if (status !== 400) return false;
   const text = String(responseText || "").toLowerCase();
   if (!text) return false;
   return (
@@ -505,64 +431,8 @@ function isAuthFailureResponse(status, responseText = "") {
     text.includes("invalid authentication") ||
     text.includes("invalid credentials") ||
     text.includes("login required") ||
-    text.includes("credentials_missing") ||
-    text.includes("expected oauth2 access token") ||
-    text.includes("api keys are not supported by this api") ||
     text.includes("missing required authentication credential")
   );
-}
-
-function isCaptchaLike403(responseText = "") {
-  const text = String(responseText || "").toLowerCase();
-  if (!text) return false;
-  return (
-    text.includes("captcha") ||
-    text.includes("recaptcha") ||
-    text.includes("public_error_unusual_activity_too_much_traffic") ||
-    text.includes("too_much_traffic")
-  );
-}
-
-function extractApiErrorReason(responseData, responseText = "") {
-  const fromDetails = (errObj) => {
-    if (!errObj || typeof errObj !== "object") return "";
-    const msg = typeof errObj.message === "string" ? errObj.message : "";
-    const details = Array.isArray(errObj.details) ? errObj.details : [];
-    for (const row of details) {
-      if (row && typeof row === "object" && typeof row.reason === "string") {
-        return msg ? `${msg} [${row.reason}]` : row.reason;
-      }
-    }
-    return msg || "";
-  };
-
-  try {
-    if (responseData && typeof responseData === "object") {
-      const directErr = responseData.error;
-      if (typeof directErr === "string" && directErr.trim()) {
-        return directErr.trim();
-      }
-      if (directErr && typeof directErr === "object") {
-        const s = fromDetails(directErr);
-        if (s) return s;
-      }
-      const nested = responseData.data;
-      if (nested && typeof nested === "object") {
-        const nestedErr = nested.error;
-        if (typeof nestedErr === "string" && nestedErr.trim()) {
-          return nestedErr.trim();
-        }
-        if (nestedErr && typeof nestedErr === "object") {
-          const s = fromDetails(nestedErr);
-          if (s) return s;
-        }
-      }
-    }
-  } catch (_) {
-    // ignore parse failures
-  }
-
-  return String(responseText || "").trim();
 }
 
 function addRequestLog(entry) {
@@ -637,7 +507,6 @@ async function init() {
     "metrics",
     "callbackSecret",
   ]);
-  await ensureRuntimeInstanceId();
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (!["unknown", "valid", "invalid"].includes(metrics.tokenAuthState)) {
@@ -1248,166 +1117,156 @@ function connectToAgent() {
   if (ws?.readyState === WebSocket.CONNECTING) return;
   if (ws?.readyState === WebSocket.OPEN) return;
 
-  void (async () => {
-    await ensureRuntimeInstanceId();
-    const wsUrl = await resolveAgentWsUrl();
-    if (manualDisconnect) return;
-    if (ws?.readyState === WebSocket.CONNECTING) return;
-    if (ws?.readyState === WebSocket.OPEN) return;
+  try {
+    ws = new WebSocket(AGENT_WS_URL);
+  } catch (e) {
+    console.error("[FlowAgent] WS connect error:", e);
+    scheduleReconnect();
+    return;
+  }
 
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (e) {
-      console.error("[FlowAgent] WS connect error:", e);
-      scheduleReconnect();
-      return;
+  ws.onopen = () => {
+    console.log("[FlowAgent] Connected to agent");
+    chrome.alarms.clear("reconnect");
+    setState("idle");
+
+    // Token refresh alarm — 45 min gives buffer before ~60 min expiry
+    chrome.alarms.create("token-refresh", { periodInMinutes: 45 });
+
+    // Send current state + resend token if we have one
+    ws.send(
+      JSON.stringify({
+        type: "extension_ready",
+        flowKeyPresent: !!flowKey,
+        tokenAge:
+          flowKey && metrics.tokenCapturedAt
+            ? Date.now() - metrics.tokenCapturedAt
+            : null,
+        tokenAuthState: metrics.tokenAuthState || "unknown",
+        tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
+        tokenAuthError: metrics.tokenAuthError || null,
+      }),
+    );
+    if (flowKey) {
+      broadcastTokenCaptured(true);
     }
+  };
 
-    ws.onopen = () => {
-      console.log("[FlowAgent] Connected to agent", wsUrl);
-      chrome.alarms.clear("reconnect");
-      setState("idle");
+  ws.onmessage = async ({ data }) => {
+    try {
+      const msg = JSON.parse(data);
 
-      // Token refresh alarm — 45 min gives buffer before ~60 min expiry
-      chrome.alarms.create("token-refresh", { periodInMinutes: 45 });
-
-      // Send current state + resend token if we have one
-      ws.send(
-        JSON.stringify({
-          type: "extension_ready",
-          runtimeInstanceId,
-          flowKeyPresent: !!flowKey,
-          tokenAge:
-            flowKey && metrics.tokenCapturedAt
-              ? Date.now() - metrics.tokenCapturedAt
-              : null,
-          tokenAuthState: metrics.tokenAuthState || "unknown",
-          tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
-          tokenAuthError: metrics.tokenAuthError || null,
-        }),
-      );
-      if (flowKey) {
-        broadcastTokenCaptured(true);
-      }
-    };
-
-    ws.onmessage = async ({ data }) => {
-      try {
-        const msg = JSON.parse(data);
-
-        if (msg.method === "api_request") {
-          await handleApiRequest(msg);
-        } else if (msg.method === "trpc_request") {
-          await handleTrpcRequest(msg);
-        } else if (msg.method === "pull_project_urls") {
-          await handlePullProjectUrls(msg);
-        } else if (msg.method === "solve_captcha") {
-          await handleSolveCaptcha(msg);
-        } else if (msg.method === "refresh_token") {
-          try {
-            await captureTokenFromFlowTab();
-            await sleep(1200);
-            sendToAgent({
-              id: msg.id,
-              result: {
-                ok: true,
-                flowKeyPresent: !!flowKey,
-                tokenAge: metrics.tokenCapturedAt
-                  ? Date.now() - metrics.tokenCapturedAt
-                  : null,
-                tokenAuthState: metrics.tokenAuthState || "unknown",
-                tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
-                tokenAuthError: metrics.tokenAuthError || null,
-              },
-            });
-          } catch (e) {
-            sendToAgent({
-              id: msg.id,
-              result: {
-                ok: false,
-                error: e?.message || "REFRESH_TOKEN_FAILED",
-                flowKeyPresent: !!flowKey,
-                tokenAge: metrics.tokenCapturedAt
-                  ? Date.now() - metrics.tokenCapturedAt
-                  : null,
-                tokenAuthState: metrics.tokenAuthState || "unknown",
-                tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
-                tokenAuthError: metrics.tokenAuthError || null,
-              },
-            });
-          }
-        } else if (msg.method === "get_status") {
-          let flowTabsPreview = [];
-          if (
-            !Number.isInteger(lastFlowTabId) ||
-            lastFlowTabId < 0 ||
-            !lastFlowSeenAt ||
-            Date.now() - lastFlowSeenAt > 45000
-          ) {
-            try {
-              const tabs = await getFlowTabs();
-              flowTabsPreview = (tabs || []).slice(0, 6).map((t) => ({
-                id: t?.id ?? null,
-                status: t?.status || null,
-                url: String(t?.url || "").slice(0, 180),
-              }));
-              const best = selectBestFlowTab(tabs);
-              if (best?.id) {
-                rememberFlowTab(best.id, best.url || "", "get_status");
-              }
-            } catch (_) {
-              // ignore status best-effort tab probing
-            }
-          }
+      if (msg.method === "api_request") {
+        await handleApiRequest(msg);
+      } else if (msg.method === "trpc_request") {
+        await handleTrpcRequest(msg);
+      } else if (msg.method === "pull_project_urls") {
+        await handlePullProjectUrls(msg);
+      } else if (msg.method === "solve_captcha") {
+        await handleSolveCaptcha(msg);
+      } else if (msg.method === "refresh_token") {
+        try {
+          await captureTokenFromFlowTab();
+          await sleep(1200);
           sendToAgent({
             id: msg.id,
             result: {
-              runtimeInstanceId,
-              connected: ws?.readyState === WebSocket.OPEN,
-              agentConnected: ws?.readyState === WebSocket.OPEN,
-              state,
-              activeProjectId: inferActiveProjectId(),
+              ok: true,
               flowKeyPresent: !!flowKey,
-              manualDisconnect,
-              flowTabId: lastFlowTabId,
-              flowTabUrl: lastFlowTabUrl || null,
-              flowTabSeenAt: lastFlowSeenAt || null,
               tokenAge: metrics.tokenCapturedAt
                 ? Date.now() - metrics.tokenCapturedAt
                 : null,
               tokenAuthState: metrics.tokenAuthState || "unknown",
               tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
               tokenAuthError: metrics.tokenAuthError || null,
-              metrics,
-              mediaCacheSize: mediaUrlCache.size,
-              projectTabBindings: flowProjectTabMap.size,
-              debugFlowTabs: flowTabsPreview,
             },
           });
-        } else if (msg.type === "callback_secret") {
-          callbackSecret = msg.secret;
-          chrome.storage.local.set({ callbackSecret: msg.secret });
-          console.log("[FlowAgent] Received callback secret");
-        } else if (msg.type === "pong") {
-          // keepalive response
+        } catch (e) {
+          sendToAgent({
+            id: msg.id,
+            result: {
+              ok: false,
+              error: e?.message || "REFRESH_TOKEN_FAILED",
+              flowKeyPresent: !!flowKey,
+              tokenAge: metrics.tokenCapturedAt
+                ? Date.now() - metrics.tokenCapturedAt
+                : null,
+              tokenAuthState: metrics.tokenAuthState || "unknown",
+              tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
+              tokenAuthError: metrics.tokenAuthError || null,
+            },
+          });
         }
-      } catch (e) {
-        console.error("[FlowAgent] Message error:", e);
+      } else if (msg.method === "get_status") {
+        let flowTabsPreview = [];
+        if (
+          !Number.isInteger(lastFlowTabId) ||
+          lastFlowTabId < 0 ||
+          !lastFlowSeenAt ||
+          Date.now() - lastFlowSeenAt > 45000
+        ) {
+          try {
+            const tabs = await getFlowTabs();
+            flowTabsPreview = (tabs || []).slice(0, 6).map((t) => ({
+              id: t?.id ?? null,
+              status: t?.status || null,
+              url: String(t?.url || "").slice(0, 180),
+            }));
+            const best = selectBestFlowTab(tabs);
+            if (best?.id) {
+              rememberFlowTab(best.id, best.url || "", "get_status");
+            }
+          } catch (_) {
+            // ignore status best-effort tab probing
+          }
+        }
+        sendToAgent({
+          id: msg.id,
+          result: {
+            connected: ws?.readyState === WebSocket.OPEN,
+            agentConnected: ws?.readyState === WebSocket.OPEN,
+            state,
+            activeProjectId: inferActiveProjectId(),
+            flowKeyPresent: !!flowKey,
+            manualDisconnect,
+            flowTabId: lastFlowTabId,
+            flowTabUrl: lastFlowTabUrl || null,
+            flowTabSeenAt: lastFlowSeenAt || null,
+            tokenAge: metrics.tokenCapturedAt
+              ? Date.now() - metrics.tokenCapturedAt
+              : null,
+            tokenAuthState: metrics.tokenAuthState || "unknown",
+            tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
+            tokenAuthError: metrics.tokenAuthError || null,
+            metrics,
+            mediaCacheSize: mediaUrlCache.size,
+            projectTabBindings: flowProjectTabMap.size,
+            debugFlowTabs: flowTabsPreview,
+          },
+        });
+      } else if (msg.type === "callback_secret") {
+        callbackSecret = msg.secret;
+        chrome.storage.local.set({ callbackSecret: msg.secret });
+        console.log("[FlowAgent] Received callback secret");
+      } else if (msg.type === "pong") {
+        // keepalive response
       }
-    };
+    } catch (e) {
+      console.error("[FlowAgent] Message error:", e);
+    }
+  };
 
-    ws.onclose = () => {
-      setState("off");
-      chrome.alarms.clear("token-refresh");
-      if (!manualDisconnect) scheduleReconnect();
-    };
+  ws.onclose = () => {
+    setState("off");
+    chrome.alarms.clear("token-refresh");
+    if (!manualDisconnect) scheduleReconnect();
+  };
 
-    ws.onerror = (e) => {
-      console.error("[FlowAgent] WS error:", e);
-      metrics.lastError = "WS_ERROR";
-      chrome.storage.local.set({ metrics });
-    };
-  })();
+  ws.onerror = (e) => {
+    console.error("[FlowAgent] WS error:", e);
+    metrics.lastError = "WS_ERROR";
+    chrome.storage.local.set({ metrics });
+  };
 }
 
 function scheduleReconnect() {
@@ -1428,7 +1287,7 @@ function keepAlive() {
 function sendToAgent(msg) {
   // API responses (with msg.id) go via HTTP — immune to WS disconnect
   if (msg.id) {
-    fetch(`${AGENT_HTTP_BASE}/api/ext/callback`, {
+    fetch("http://127.0.0.1:8100/api/ext/callback", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(msg),
@@ -2478,12 +2337,12 @@ async function handleApiRequest(msg) {
       }
     }
 
-    // Token/context may be stale (401/403 and sometimes 400 on credits endpoint).
-    // Try one token-refresh + one retry even if token string stays unchanged.
+    // Token/context may be stale (401 and sometimes 400 on credits endpoint).
+    // Try one token-refresh + one retry.
     const shouldRetryAuth =
       response
       && (
-        isAuthFailureResponse(response.status, responseText)
+        response.status === 401
         || (isCreditsRead && response.status === 400)
       );
     if (shouldRetryAuth) {
@@ -2493,59 +2352,26 @@ async function handleApiRequest(msg) {
         // ignore refresh errors and keep original response
       }
       await sleep(900);
-      const refreshedFlowKey = flowKey || activeFlowKey;
-      if (refreshedFlowKey) {
+      const refreshedFlowKey = flowKey;
+      if (refreshedFlowKey && refreshedFlowKey !== activeFlowKey) {
         activeFlowKey = refreshedFlowKey;
-      }
-      try {
-        response = await performApiFetch(activeFlowKey, {
-          minimal: isReadGet && (isMediaRead || isCreditsRead),
-          dropProjectContext: false,
-        });
-        responseText = await response.text();
-      } catch (retry401Err) {
-        if (!(isReadGet && (isMediaRead || isCreditsRead))) throw retry401Err;
-        const viaTab = await performFlowTabFetch(
-          buildFetchUrl({ dropProjectContext: false }),
-          methodUpper,
-          buildFetchHeaders(activeFlowKey, { minimal: true }),
-          finalBody,
-          requestProjectId,
-        );
-        applyTabResponse(viaTab);
-      }
-    }
-
-    // Some Google endpoints can reject extension-service-worker fetch (403)
-    // while succeeding from the actual Flow tab context.
-    const shouldRetryViaFlowTab =
-      response
-      && response.status === 403
-      && (
-        shouldRetryAuth
-        || !isCaptchaLike403(responseText)
-      );
-    if (shouldRetryViaFlowTab) {
-      try {
-        const viaTab = await performFlowTabFetch(
-          buildFetchUrl({ dropProjectContext: false }),
-          methodUpper,
-          buildFetchHeaders(activeFlowKey, {
+        try {
+          response = await performApiFetch(activeFlowKey, {
             minimal: isReadGet && (isMediaRead || isCreditsRead),
-          }),
-          finalBody,
-          requestProjectId,
-        );
-        // Prefer tab result when successful, or when it gives a different status
-        // that is easier for agent-side retry policies to classify.
-        if (
-          Number(viaTab?.status) < 400
-          || Number(viaTab?.status) !== Number(response.status)
-        ) {
+            dropProjectContext: false,
+          });
+          responseText = await response.text();
+        } catch (retry401Err) {
+          if (!(isReadGet && (isMediaRead || isCreditsRead))) throw retry401Err;
+          const viaTab = await performFlowTabFetch(
+            buildFetchUrl({ dropProjectContext: false }),
+            methodUpper,
+            buildFetchHeaders(activeFlowKey, { minimal: true }),
+            finalBody,
+            requestProjectId,
+          );
           applyTabResponse(viaTab);
         }
-      } catch (_) {
-        // Keep current response on tab fallback failures.
       }
     }
 
@@ -2598,21 +2424,13 @@ async function handleApiRequest(msg) {
         responseSummary,
       });
     } else {
-      const reasonRaw = extractApiErrorReason(responseData, responseText);
-      const reason = String(reasonRaw || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 160);
-      const errorLabel = reason
-        ? `API_${response.status}: ${reason}`
-        : `API_${response.status}`;
       if (hasCaptcha) {
         metrics.failedCount++;
-        metrics.lastError = errorLabel;
+        metrics.lastError = `API_${response.status}`;
       }
       updateRequestLog(logId, {
         status: "failed",
-        error: errorLabel,
+        error: `API_${response.status}`,
         httpStatus: response.status,
         responseSummary,
       });
@@ -2684,7 +2502,6 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 
   if (msg.type === "STATUS") {
     reply({
-      runtimeInstanceId,
       connected: ws?.readyState === WebSocket.OPEN,
       agentConnected: ws?.readyState === WebSocket.OPEN,
       flowKeyPresent: !!flowKey,

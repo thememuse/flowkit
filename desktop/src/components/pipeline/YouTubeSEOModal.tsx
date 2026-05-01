@@ -23,6 +23,7 @@ const PROVIDERS: { id: ProviderType; label: string }[] = [
     { id: 'gemini', label: 'Gemini' },
     { id: 'claude', label: 'Claude' },
     { id: 'openai', label: 'OpenAI' },
+    { id: 'deepseek', label: 'DeepSeek' },
 ]
 
 const SYSTEM_PROMPT = `You are a YouTube SEO expert specializing in documentary content.

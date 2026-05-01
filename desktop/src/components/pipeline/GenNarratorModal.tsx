@@ -15,6 +15,7 @@ const PROVIDERS: { id: ProviderType; label: string }[] = [
     { id: 'gemini', label: 'Gemini' },
     { id: 'claude', label: 'Claude' },
     { id: 'openai', label: 'OpenAI' },
+    { id: 'deepseek', label: 'DeepSeek' },
 ]
 
 interface Scene {

@@ -1,6 +1,6 @@
 import { ChildProcess, execSync, spawn } from 'child_process'
 import { delimiter, join } from 'path'
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync } from 'fs'
 import { app } from 'electron'
 import { EventEmitter } from 'events'
 
@@ -14,7 +14,6 @@ const MAX_RETRIES = 5
 const RESTART_DELAY_MS = 3000
 const HEALTH_POLL_MS = 600
 const HEALTH_TIMEOUT_MS = 20000
-const AGENT_RUNTIME_DIR_NAME = 'agent-runtime'
 
 class Sidecar extends EventEmitter {
     private process: ChildProcess | null = null
@@ -24,29 +23,11 @@ class Sidecar extends EventEmitter {
     private abortReady = false
     private resolvingPortConflict = false
 
-    private _shouldForceBundledAgent(): boolean {
-        // On packaged Windows builds, stale external agents frequently cause
-        // partial-compatibility states (dashboard up, other APIs broken, extension off).
-        // Force this app's bundled runtime to take over port 8100.
-        return app.isPackaged && process.platform === 'win32'
-    }
-
     async start() {
         this.stopping = false
-        const forceBundled = this._shouldForceBundledAgent()
         // If port is already occupied by an external instance, adopt only if compatible.
         const alreadyUp = await this._checkHealth()
         if (alreadyUp) {
-            if (forceBundled) {
-                console.warn('[sidecar] Packaged Windows mode: forcing bundled agent takeover on :8100')
-                const replaced = await this._replaceIncompatibleProcess()
-                if (!replaced) {
-                    this.emit('status', 'Error — cannot replace stale agent on port 8100')
-                    return
-                }
-                this._spawn()
-                return
-            }
             const compatible = await this._checkCompatibility()
             if (compatible) {
                 const preferred = this._isPreferredAgentOnPort(AGENT_PORT)
@@ -100,10 +81,6 @@ class Sidecar extends EventEmitter {
         this.emit('status', 'Starting...')
 
         const sidecarEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
-        const runtimeDir = this._resolveAgentRuntimeDir()
-        if (runtimeDir) {
-            sidecarEnv.FLOW_AGENT_DIR = runtimeDir
-        }
         this._injectLocalUpscaleRuntimeEnv(sidecarEnv)
 
         this.process = spawn(bin, args, {
@@ -115,16 +92,10 @@ class Sidecar extends EventEmitter {
         this.process.on('error', async (err: NodeJS.ErrnoException) => {
             console.error('[sidecar] Spawn failed:', err)
             this.abortReady = true
-            const forceBundled = this._shouldForceBundledAgent()
 
             // If another agent is already healthy, adopt it instead of failing hard.
             const alreadyUp = await this._checkHealth()
             if (alreadyUp) {
-                if (forceBundled) {
-                    console.warn('[sidecar] Spawn failed in packaged Windows mode — refusing to adopt external agent.')
-                    this.emit('status', `Error — spawn failed (${err.code || 'unknown'})`)
-                    return
-                }
                 const compatible = await this._checkCompatibility()
                 if (compatible) {
                     console.log('[sidecar] Spawn failed but external compatible agent is healthy — adopting.')
@@ -194,13 +165,12 @@ class Sidecar extends EventEmitter {
         try {
             console.warn('[sidecar] Port 8100 already in use — checking compatibility.')
             this.stopping = true // suppress auto-restart while we resolve conflict
-            const forceBundled = this._shouldForceBundledAgent()
 
             // Give current process a moment to exit after bind failure.
             await this._sleep(500)
 
             const healthy = await this._checkHealth()
-            if (healthy && !forceBundled) {
+            if (healthy) {
                 const compatible = await this._checkCompatibility()
                 if (compatible) {
                     console.log('[sidecar] External compatible agent detected — adopting.')
@@ -429,10 +399,7 @@ class Sidecar extends EventEmitter {
         if (!lower) return false
 
         if (app.isPackaged) {
-            const expectedRoot = (process.resourcesPath || '').toLowerCase().replace(/\\/g, '/')
-            const normalizedCmd = lower.replace(/\\/g, '/')
-            if (!expectedRoot) return normalizedCmd.includes('flowkit-agent')
-            return normalizedCmd.includes('flowkit-agent') && normalizedCmd.includes(expectedRoot)
+            return lower.includes('flowkit-agent')
         }
 
         const projectRoot = join(__dirname, '../../..')
@@ -546,17 +513,6 @@ class Sidecar extends EventEmitter {
         }
 
         console.log('[sidecar] Local upscale runtime root:', chosenRoot)
-    }
-
-    private _resolveAgentRuntimeDir(): string {
-        try {
-            const runtimeDir = join(app.getPath('userData'), AGENT_RUNTIME_DIR_NAME)
-            mkdirSync(runtimeDir, { recursive: true })
-            return runtimeDir
-        } catch (err) {
-            console.warn('[sidecar] Failed to prepare persistent runtime dir, fallback to defaults:', err)
-            return ''
-        }
     }
 }
 

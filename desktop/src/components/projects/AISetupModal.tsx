@@ -14,6 +14,7 @@ const PROVIDERS: { id: ProviderType; label: string }[] = [
     { id: 'gemini', label: 'Gemini' },
     { id: 'claude', label: 'Claude' },
     { id: 'openai', label: 'OpenAI' },
+    { id: 'deepseek', label: 'DeepSeek' },
 ]
 const FALLBACK_MATERIALS = ['realistic', '3d_pixar', 'anime', 'watercolor', 'cinematic']
 const SCENE_COUNTS = [4, 6, 8, 10, 12, 16, 20, 24, 30, 40]
@@ -55,6 +56,10 @@ function keyStats(provider: ProviderType) {
     const keys = loadKeys(provider)
     const active = keys.filter(k => k.status === 'active').length
     return { active, total: keys.length }
+}
+
+function providerLabel(provider: ProviderType): string {
+    return PROVIDERS.find(p => p.id === provider)?.label ?? provider
 }
 
 function formatEstimatedDuration(sceneCount: number): string {
@@ -172,8 +177,8 @@ function ResearchStep({
                 <div className="flex items-start gap-2 rounded p-3 text-xs" style={{ background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)', color: 'var(--yellow)' }}>
                     <AlertCircle size={14} className="flex-shrink-0 mt-0.5" />
                     {stats.total > 0
-                        ? <>Có {stats.total} key nhưng chưa key nào khả dụng cho {provider}. Bước nghiên cứu web vẫn chạy được; bước <strong>Phân tích AI</strong> cần key hợp lệ ở <strong>Cài đặt → {provider.charAt(0).toUpperCase() + provider.slice(1)}</strong>.</>
-                        : <>Chưa có API key khả dụng cho {provider}. Bước nghiên cứu web vẫn chạy được; để phân tích AI hãy vào <strong>Cài đặt → {provider.charAt(0).toUpperCase() + provider.slice(1)}</strong>.</>
+                        ? <>Có {stats.total} key nhưng chưa key nào khả dụng cho {providerLabel(provider)}. Bước nghiên cứu web vẫn chạy được; bước <strong>Phân tích AI</strong> cần key hợp lệ ở <strong>Cài đặt → {providerLabel(provider)}</strong>.</>
+                        : <>Chưa có API key khả dụng cho {providerLabel(provider)}. Bước nghiên cứu web vẫn chạy được; để phân tích AI hãy vào <strong>Cài đặt → {providerLabel(provider)}</strong>.</>
                     }
                 </div>
             )}
@@ -246,8 +251,8 @@ function StoryStep({
                 <div className="flex items-start gap-2 rounded p-3 text-xs" style={{ background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)', color: 'var(--yellow)' }}>
                     <AlertCircle size={14} className="flex-shrink-0 mt-0.5" />
                     {stats.total > 0
-                        ? <>Có {stats.total} key nhưng chưa key nào khả dụng cho {provider}. Vào <strong>Cài đặt → {provider.charAt(0).toUpperCase() + provider.slice(1)}</strong></>
-                        : <>Chưa có API key cho {provider}. Vào <strong>Cài đặt → {provider.charAt(0).toUpperCase() + provider.slice(1)}</strong></>
+                        ? <>Có {stats.total} key nhưng chưa key nào khả dụng cho {providerLabel(provider)}. Vào <strong>Cài đặt → {providerLabel(provider)}</strong></>
+                        : <>Chưa có API key cho {providerLabel(provider)}. Vào <strong>Cài đặt → {providerLabel(provider)}</strong></>
                     }
                 </div>
             )}
@@ -347,7 +352,7 @@ function StoryStep({
             <div className="flex justify-end gap-2 pt-2">
                 <ActionButton variant="ghost" onClick={onBack}>← Nghiên cứu</ActionButton>
                 <ActionButton variant="primary" onClick={onAnalyze} disabled={!projectStory.trim() || !hasKeys}>
-                    <Sparkles size={13} /> Phân tích với {provider.charAt(0).toUpperCase() + provider.slice(1)}
+                    <Sparkles size={13} /> Phân tích với {providerLabel(provider)}
                 </ActionButton>
             </div>
         </div>
@@ -360,7 +365,7 @@ function AnalyzingStep({ provider }: { provider: ProviderType }) {
         <div className="flex flex-col items-center justify-center py-16 gap-4">
             <div className="w-10 h-10 rounded-full border-2 animate-spin" style={{ borderColor: 'var(--accent)', borderTopColor: 'transparent' }} />
             <div className="text-sm font-semibold" style={{ color: 'var(--text)' }}>Đang phân tích kịch bản...</div>
-            <div className="text-xs" style={{ color: 'var(--muted)' }}>Giao tiếp với {provider} API</div>
+            <div className="text-xs" style={{ color: 'var(--muted)' }}>Giao tiếp với {providerLabel(provider)} API</div>
         </div>
     )
 }
@@ -797,7 +802,7 @@ Return JSON:
     const titles: Record<Step, string> = {
         research: '🔍 Nghiên cứu chủ đề',
         story: '🪄 Tạo project + video với AI',
-        analyzing: `⚙️ Đang phân tích với ${provider}...`,
+        analyzing: `⚙️ Đang phân tích với ${providerLabel(provider)}...`,
         review: '✏️ Xem & Chỉnh sửa',
         creating: '⚙️ Đang tạo...',
     }

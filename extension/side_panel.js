@@ -41,7 +41,6 @@ let _projectPollTimer = null;
 let _keepAlivePort = null;
 let _keepAliveTimer = null;
 let _lastReconnectKickAt = 0;
-let _lastBoundRuntimeId = '';
 const PROJECT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function normalizeProjectId(value) {
@@ -84,12 +83,6 @@ function formatTime(iso) {
 
 function updateStatus(data) {
   if (!data) return;
-  const runtimeId = String(
-    data.runtimeInstanceId
-    || data.runtime_instance_id
-    || '',
-  ).trim();
-  if (runtimeId) void bindPreferredRuntime(runtimeId);
 
   // Connection dot
   const dot = document.getElementById('conn-dot');
@@ -257,23 +250,6 @@ function escHtml(str) {
 function truncate(str, len) {
   if (!str || str.length <= len) return str;
   return str.slice(0, len) + '…';
-}
-
-async function bindPreferredRuntime(runtimeId) {
-  const normalized = String(runtimeId || '').trim();
-  if (!normalized || normalized === _lastBoundRuntimeId) return;
-  try {
-    const res = await fetch('http://127.0.0.1:8100/api/flow/preferred-runtime', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ runtime_instance_id: normalized }),
-      cache: 'no-store',
-    });
-    if (!res.ok) return;
-    _lastBoundRuntimeId = normalized;
-  } catch {
-    // ignore transient backend/network failures
-  }
 }
 
 function setProjectId(projectId) {

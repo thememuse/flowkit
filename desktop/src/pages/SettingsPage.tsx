@@ -18,12 +18,13 @@ import {
     Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '../components/ui/select'
 
-type Tab = 'gemini' | 'claude' | 'openai' | 'general' | 'flow' | 'models' | 'materials' | 'tts' | 'license'
+type Tab = 'gemini' | 'claude' | 'openai' | 'deepseek' | 'general' | 'flow' | 'models' | 'materials' | 'tts' | 'license'
 
 const PROVIDERS: { id: ProviderType; label: string; color: string; docUrl: string; placeholder: string }[] = [
     { id: 'gemini', label: 'Gemini', color: '#4285f4', docUrl: 'https://aistudio.google.com/apikey', placeholder: 'AIzaSy...' },
     { id: 'claude', label: 'Claude', color: '#d97706', docUrl: 'https://console.anthropic.com/keys', placeholder: 'sk-ant-...' },
     { id: 'openai', label: 'OpenAI', color: '#10b981', docUrl: 'https://platform.openai.com/api-keys', placeholder: 'sk-proj-...' },
+    { id: 'deepseek', label: 'DeepSeek', color: '#2563eb', docUrl: 'https://platform.deepseek.com/api_keys', placeholder: 'sk-...' },
 ]
 
 const FALLBACK_MATERIALS = ['realistic', '3d_pixar', 'anime', 'watercolor', 'cinematic']
@@ -31,6 +32,10 @@ const LANGUAGES = [
     { code: 'vi', label: 'Tiếng Việt' }, { code: 'en', label: 'Tiếng Anh' },
     { code: 'es', label: 'Tiếng Tây Ban Nha' },
     { code: 'zh', label: 'Tiếng Trung' }, { code: 'ja', label: 'Tiếng Nhật' }, { code: 'ko', label: 'Tiếng Hàn' },
+]
+const DEEPSEEK_MODELS = [
+    { id: 'deepseek-chat', label: 'DeepSeek Chat (nhanh, ổn định)' },
+    { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner (lý luận sâu)' },
 ]
 
 const LICENSE_STATUS_LABEL: Record<LicenseStatus, string> = {
@@ -71,6 +76,7 @@ function looksLikeProviderKey(provider: ProviderType, key: string): boolean {
     if (!value || /^\d+$/.test(value) || value.length < 12) return false
     if (provider === 'gemini') return value.startsWith('AIza')
     if (provider === 'claude') return value.startsWith('sk-ant-')
+    if (provider === 'deepseek') return value.startsWith('sk-')
     // OpenAI keys are usually sk-... or sk-proj-...
     return value.startsWith('sk-')
 }
@@ -78,6 +84,7 @@ function looksLikeProviderKey(provider: ProviderType, key: string): boolean {
 function keyFormatHint(provider: ProviderType): string {
     if (provider === 'gemini') return 'AIza...'
     if (provider === 'claude') return 'sk-ant-...'
+    if (provider === 'deepseek') return 'sk-...'
     return 'sk-proj-... / sk-...'
 }
 
@@ -266,6 +273,8 @@ function ProviderKeysPanel({ provider, color, docUrl, placeholder }: {
 // ─── General Panel ────────────────────────────────────────────
 function GeneralPanel({ materials }: { materials: string[] }) {
     const [settings, setSettings] = useState<GeneralSettings>(loadGeneralSettings())
+    const [deepseekKeyQuick, setDeepseekKeyQuick] = useState('')
+    const [deepseekQuickMsg, setDeepseekQuickMsg] = useState('')
     const hasDirectoryPicker = Boolean(window.electron?.pickDirectory)
 
     useEffect(() => {
@@ -275,6 +284,12 @@ function GeneralPanel({ materials }: { materials: string[] }) {
             setSettings(next); saveGeneralSettings(next)
         }
     }, [materials, settings])
+
+    useEffect(() => {
+        const keys = loadKeys('deepseek')
+        const first = keys.find(k => k.status !== 'invalid') ?? keys[0]
+        setDeepseekKeyQuick(first?.key ?? '')
+    }, [])
 
     function update(field: keyof GeneralSettings, value: string) {
         const next = { ...settings, [field]: value }
@@ -295,6 +310,42 @@ function GeneralPanel({ materials }: { materials: string[] }) {
 
     const options = materials.length > 0 ? materials : FALLBACK_MATERIALS
 
+    const saveDeepSeekQuickKey = () => {
+        const value = deepseekKeyQuick.trim()
+        if (!value) {
+            setDeepseekQuickMsg('Nhập DeepSeek key trước khi lưu.')
+            return
+        }
+        if (!looksLikeProviderKey('deepseek', value)) {
+            setDeepseekQuickMsg('DeepSeek key không đúng định dạng (sk-...).')
+            return
+        }
+
+        const existing = loadKeys('deepseek')
+        const same = existing.find(k => k.key.trim() === value)
+        let next: APIKey[] = []
+        if (same) {
+            next = existing.map(k => (k.id === same.id
+                ? { ...k, status: 'active', limitedAt: undefined }
+                : k))
+        } else if (existing.length > 0) {
+            next = [
+                {
+                    ...existing[0],
+                    key: value,
+                    status: 'active',
+                    limitedAt: undefined,
+                    label: existing[0].label || 'Key 1',
+                },
+                ...existing.slice(1),
+            ]
+        } else {
+            next = [{ id: generateId(), label: 'Key 1', key: value, status: 'active' }]
+        }
+        saveKeys('deepseek', next)
+        setDeepseekQuickMsg('Đã lưu DeepSeek key.')
+    }
+
     return (
         <div className="flex flex-col gap-4 max-w-2xl">
             <Field label="AI Provider mặc định">
@@ -304,6 +355,39 @@ function GeneralPanel({ materials }: { materials: string[] }) {
                         {PROVIDERS.map(p => <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>)}
                     </SelectContent>
                 </Select>
+            </Field>
+            <Field label="DeepSeek model (cho viết kịch bản/SEO/TTS text)">
+                <Select value={settings.deepseekModel} onValueChange={(v: string) => update('deepseekModel', v)}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                        {DEEPSEEK_MODELS.map(m => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}
+                    </SelectContent>
+                </Select>
+            </Field>
+            <Field label="DeepSeek API key (nhập nhanh)">
+                <div className="flex flex-col gap-2">
+                    <div className="flex gap-2">
+                        <Input
+                            value={deepseekKeyQuick}
+                            onChange={(e) => {
+                                setDeepseekKeyQuick(e.target.value)
+                                if (deepseekQuickMsg) setDeepseekQuickMsg('')
+                            }}
+                            placeholder="sk-..."
+                            type="password"
+                            className="text-xs"
+                        />
+                        <Button variant="secondary" onClick={saveDeepSeekQuickKey}>
+                            Lưu key
+                        </Button>
+                    </div>
+                    <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                        Hoặc quản lý nhiều key ở tab <strong>DeepSeek</strong>.
+                    </div>
+                    {deepseekQuickMsg && (
+                        <div className="text-xs text-[hsl(var(--muted-foreground))]">{deepseekQuickMsg}</div>
+                    )}
+                </div>
             </Field>
             <Field label="Ngôn ngữ mặc định">
                 <Select value={settings.defaultLanguage} onValueChange={(v: string) => update('defaultLanguage', v)}>
@@ -1285,7 +1369,7 @@ export default function SettingsPage() {
             </div>
 
             <Tabs defaultValue="gemini">
-                <TabsList className="mb-4">
+                <TabsList className="mb-4 w-full flex-nowrap overflow-x-auto whitespace-nowrap">
                     {PROVIDERS.map(p => (
                         <TabsTrigger key={p.id} value={p.id} className={settingsTabTriggerClass}>
                             {p.label}

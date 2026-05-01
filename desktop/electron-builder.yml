@@ -19,10 +19,6 @@ extraResources:
     to: agent
     filter:
       - "**/*"
-  - from: resources/ffmpeg
-    to: ffmpeg
-    filter:
-      - "**/*"
 
 mac:
   category: public.app-category.productivity
@@ -35,10 +31,6 @@ win:
   target:
     - target: nsis
       arch: [x64]
-    - target: portable
-      arch: [x64]
-    - target: zip
-      arch: [x64]
   icon: resources/icon.ico
 
 nsis:
@@ -48,8 +40,3 @@ nsis:
   uninstallerIcon: resources/icon.ico
   createDesktopShortcut: true
   createStartMenuShortcut: true
-
-publish:
-  provider: github
-  owner: thememuse
-  repo: flowkit
