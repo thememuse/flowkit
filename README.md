@@ -418,7 +418,7 @@ Skills work with any AI CLI that can read files:
 | CLI | Instructions | How skills work |
 |-----|-------------|-----------------|
 | Claude Code | `CLAUDE.md` (auto-loaded) | Native `/fk:` slash commands |
-| Codex CLI | `AGENTS.md` → reads `CLAUDE.md` | User says `/fk:<name>`, agent reads `skills/fk:<name>.md` |
+| Codex CLI | `AGENTS.md` → reads `CLAUDE.md` | User says `/fk:<name>`, agent reads `skills/fk-<name>.md` |
 | Gemini CLI | `GEMINI.md` → reads `CLAUDE.md` | Same pattern |
 
 ## Video Generation Techniques
@@ -545,7 +545,7 @@ Optional narrator voice for scenes. Uses [OmniVoice](https://github.com/tuannguy
 
 ### Setup
 
-See `skills/fk:gen-tts-template.md` for full install guide. Quick version:
+See `skills/fk-gen-tts-template.md` for full install guide. Quick version:
 
 ```bash
 pip install torch==2.8.0 torchaudio==2.8.0   # or +cu128 for NVIDIA

@@ -297,7 +297,7 @@ When a character appears in the scene image, their face MUST be fully visible (f
 
 **`voice_description`** on characters (max ~30 words) — auto-appended to video prompts by the worker. Dialogue tone must match voice profile. Example: `"Deep calm heroic voice, speaks slowly with confidence"`.
 
-See `fk:camera-guide.md` for full camera language reference.
+See `fk-camera-guide.md` for full camera language reference.
 
 ---
 
@@ -373,7 +373,7 @@ SFX: soft footsteps on crystallized sugar ground.
 Negative: subtitles, watermark, text overlay.
 ```
 
-See `fk:camera-guide.md` for full Veo 3 camera/lighting/audio vocabulary and prompt template.
+See `fk-camera-guide.md` for full Veo 3 camera/lighting/audio vocabulary and prompt template.
 
 ---
 
@@ -393,7 +393,7 @@ See `fk:camera-guide.md` for full Veo 3 camera/lighting/audio vocabulary and pro
 Captain Harris spots unusual radar signatures. Dozens of Iranian fast boats race straight toward the convoy. He orders battle stations.
 ```
 
-See `fk:gen-narrator.md` for word count limits per language and narrative arc guide.
+See `fk-gen-narrator.md` for word count limits per language and narrative arc guide.
 
 ---
 
