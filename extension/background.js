@@ -19,6 +19,7 @@ let state = "off"; // off | idle | running
 let manualDisconnect = false;
 let initialized = false;
 let keepAlivePortCount = 0;
+let runtimeInstanceId = "";
 let lastFlowTabId = null;
 let lastFlowTabUrl = "";
 let lastFlowSeenAt = 0;
@@ -38,6 +39,7 @@ const MAX_MEDIA_CACHE_SIZE = 2500;
 const MEDIA_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MEDIA_URL_MIN_REMAINING_MS = 90 * 1000;
 const MEDIA_CACHE_STORAGE_KEY = "mediaUrlCacheV1";
+const RUNTIME_INSTANCE_STORAGE_KEY = "runtimeInstanceIdV1";
 const MEDIA_CACHE_FLUSH_DELAY_MS = 450;
 const TOKEN_CAPTURE_REBROADCAST_MS = 120000;
 const mediaUrlCache = new Map();
@@ -46,6 +48,37 @@ let mediaCacheSaveTimer = null;
 let mediaForwardTimer = null;
 let lastTokenBroadcastValue = "";
 let lastTokenBroadcastAt = 0;
+
+function buildRuntimeInstanceId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch (_) {
+    // fallback below
+  }
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `rt-${Date.now().toString(36)}-${rand}`;
+}
+
+async function ensureRuntimeInstanceId() {
+  if (runtimeInstanceId) return runtimeInstanceId;
+  try {
+    const data = await chrome.storage.local.get([RUNTIME_INSTANCE_STORAGE_KEY]);
+    const persisted = String(data?.[RUNTIME_INSTANCE_STORAGE_KEY] || "").trim();
+    if (persisted) {
+      runtimeInstanceId = persisted;
+      return runtimeInstanceId;
+    }
+  } catch (_) {
+    // fallback below
+  }
+  runtimeInstanceId = buildRuntimeInstanceId();
+  try {
+    await chrome.storage.local.set({ [RUNTIME_INSTANCE_STORAGE_KEY]: runtimeInstanceId });
+  } catch (_) {
+    // ignore storage write failures
+  }
+  return runtimeInstanceId;
+}
 
 function _safePort(value, fallback = DEFAULT_AGENT_WS_PORT) {
   const port = Number(value);
@@ -604,6 +637,7 @@ async function init() {
     "metrics",
     "callbackSecret",
   ]);
+  await ensureRuntimeInstanceId();
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (!["unknown", "valid", "invalid"].includes(metrics.tokenAuthState)) {
@@ -1215,6 +1249,7 @@ function connectToAgent() {
   if (ws?.readyState === WebSocket.OPEN) return;
 
   void (async () => {
+    await ensureRuntimeInstanceId();
     const wsUrl = await resolveAgentWsUrl();
     if (manualDisconnect) return;
     if (ws?.readyState === WebSocket.CONNECTING) return;
@@ -1240,6 +1275,7 @@ function connectToAgent() {
       ws.send(
         JSON.stringify({
           type: "extension_ready",
+          runtimeInstanceId,
           flowKeyPresent: !!flowKey,
           tokenAge:
             flowKey && metrics.tokenCapturedAt
@@ -1326,6 +1362,7 @@ function connectToAgent() {
           sendToAgent({
             id: msg.id,
             result: {
+              runtimeInstanceId,
               connected: ws?.readyState === WebSocket.OPEN,
               agentConnected: ws?.readyState === WebSocket.OPEN,
               state,
@@ -2647,6 +2684,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 
   if (msg.type === "STATUS") {
     reply({
+      runtimeInstanceId,
       connected: ws?.readyState === WebSocket.OPEN,
       agentConnected: ws?.readyState === WebSocket.OPEN,
       flowKeyPresent: !!flowKey,

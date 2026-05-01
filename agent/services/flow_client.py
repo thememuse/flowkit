@@ -514,7 +514,9 @@ class FlowClient:
         self._extension_ws = None  # Set by WS server when extension connects
         self._extension_ws_pool: set = set()
         self._extension_ws_order: dict[object, int] = {}
+        self._ws_runtime_instance: dict[object, str] = {}
         self._extension_ws_seq = 0
+        self._preferred_runtime_instance_id: str = ""
         self._pending: dict[str, asyncio.Future] = {}
         self._flow_key: Optional[str] = None
         self._sync_in_progress = False
@@ -533,6 +535,22 @@ class FlowClient:
         self._ws_last_disconnect_at: Optional[float] = None
         # Guard against pull_project_urls spam when UI retries many broken media at once.
         self._project_pull_cooldown_until: dict[str, float] = {}
+
+    @staticmethod
+    def _normalize_runtime_instance_id(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text[:128]
+
+    def set_preferred_runtime_instance_id(self, runtime_instance_id: str | None) -> str:
+        normalized = self._normalize_runtime_instance_id(runtime_instance_id)
+        self._preferred_runtime_instance_id = normalized
+        if normalized:
+            logger.info("Preferred extension runtime set: %s", normalized)
+        else:
+            logger.info("Preferred extension runtime cleared")
+        return normalized
 
     def set_extension(self, ws):
         """Called when extension connects via WS."""
@@ -572,8 +590,20 @@ class FlowClient:
             if getattr(ws, "closed", False):
                 self._extension_ws_pool.discard(ws)
                 self._extension_ws_order.pop(ws, None)
+                self._ws_runtime_instance.pop(ws, None)
                 continue
             live.append(ws)
+
+        preferred = self._preferred_runtime_instance_id
+        if preferred:
+            preferred_ws = [
+                ws for ws in live
+                if self._normalize_runtime_instance_id(self._ws_runtime_instance.get(ws, "")) == preferred
+            ]
+            if preferred_ws:
+                others = [ws for ws in live if ws not in preferred_ws]
+                return preferred_ws + others
+
         if self._extension_ws in live:
             live.remove(self._extension_ws)
             live.insert(0, self._extension_ws)
@@ -588,6 +618,7 @@ class FlowClient:
         if ws is not None:
             self._extension_ws_pool.discard(ws)
             self._extension_ws_order.pop(ws, None)
+            self._ws_runtime_instance.pop(ws, None)
             if self._extension_ws is ws:
                 self._extension_ws = self._choose_live_ws()
             elif self._extension_ws is None:
@@ -595,6 +626,7 @@ class FlowClient:
         else:
             self._extension_ws_pool.clear()
             self._extension_ws_order.clear()
+            self._ws_runtime_instance.clear()
             self._extension_ws = None
 
         self._ws_disconnect_count += 1
@@ -640,7 +672,7 @@ class FlowClient:
             "uptime_s": uptime,
         }
 
-    async def handle_message(self, data: dict):
+    async def handle_message(self, data: dict, ws=None):
         """Handle incoming message from extension."""
         if data.get("type") == "token_captured":
             new_key = str(data.get("flowKey") or "").strip()
@@ -657,6 +689,9 @@ class FlowClient:
 
         if data.get("type") == "extension_ready":
             logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
+            runtime_id = self._normalize_runtime_instance_id(data.get("runtimeInstanceId"))
+            if runtime_id and ws is not None:
+                self._ws_runtime_instance[ws] = runtime_id
             # Avoid redundant credits checks on each worker reconnect.
             self._queue_tier_sync(reason="extension_ready")
             return
@@ -670,8 +705,9 @@ class FlowClient:
 
         if data.get("type") == "ping":
             # Respond to keepalive
-            if self._extension_ws:
-                await self._extension_ws.send(json.dumps({"type": "pong"}))
+            target = ws or self._extension_ws
+            if target:
+                await target.send(json.dumps({"type": "pong"}))
             return
 
         # Response to a pending request
@@ -1762,6 +1798,26 @@ class FlowClient:
         ws_candidates = self._live_ws_candidates()
         if not ws_candidates:
             return {"error": "Extension not connected"}
+        preferred_runtime = self._preferred_runtime_instance_id
+        preferred_candidates = []
+        if preferred_runtime:
+            preferred_candidates = [
+                ws for ws in ws_candidates
+                if self._normalize_runtime_instance_id(self._ws_runtime_instance.get(ws, "")) == preferred_runtime
+            ]
+        has_preferred_candidate = bool(preferred_candidates)
+        strict_preferred_methods = {
+            "api_request",
+            "trpc_request",
+            "pull_project_urls",
+            "solve_captcha",
+            "refresh_token",
+        }
+        if preferred_runtime and method in strict_preferred_methods:
+            if not has_preferred_candidate:
+                return {"error": f"Preferred extension runtime not connected ({preferred_runtime})"}
+            # Keep runtime routing deterministic once panel has bound a preferred runtime.
+            ws_candidates = preferred_candidates
 
         def _prefer_another_ws(result: dict, attempt_index: int) -> bool:
             if attempt_index >= len(ws_candidates) - 1:
@@ -1779,6 +1835,19 @@ class FlowClient:
                 agent_connected = bool(
                     data.get("agentConnected", data.get("connected", False))
                 )
+                runtime_id = self._normalize_runtime_instance_id(
+                    data.get("runtimeInstanceId") or data.get("runtime_instance_id")
+                )
+                if runtime_id:
+                    self._ws_runtime_instance[ws_candidates[attempt_index]] = runtime_id
+
+                if (
+                    has_preferred_candidate
+                    and preferred_runtime
+                    and runtime_id
+                    and runtime_id != preferred_runtime
+                ):
+                    return True
 
                 # When multiple extension workers exist (multi-session/account),
                 # the first responder can be an OFF worker. Prefer trying another
@@ -1828,6 +1897,16 @@ class FlowClient:
                     "params": params,
                 }))
                 result = await asyncio.wait_for(future, timeout=timeout)
+                if method == "get_status":
+                    raw_data = result.get("data")
+                    if not isinstance(raw_data, dict):
+                        raw_data = result.get("result")
+                    data = raw_data if isinstance(raw_data, dict) else {}
+                    runtime_id = self._normalize_runtime_instance_id(
+                        data.get("runtimeInstanceId") or data.get("runtime_instance_id")
+                    )
+                    if runtime_id:
+                        self._ws_runtime_instance[ws] = runtime_id
                 last_error = result
                 if _prefer_another_ws(result, idx):
                     logger.info(
@@ -2293,6 +2372,7 @@ class FlowClient:
                 "state": "off",
                 "manual_disconnect": False,
                 "runtime_connected": False,
+                "preferred_runtime_instance_id": self._preferred_runtime_instance_id or None,
                 "token_auth_state": "unknown",
                 "token_auth_checked_at": None,
                 "token_auth_error": None,
@@ -2307,6 +2387,7 @@ class FlowClient:
                 "state": "off",
                 "manual_disconnect": False,
                 "runtime_connected": False,
+                "preferred_runtime_instance_id": self._preferred_runtime_instance_id or None,
                 "error": _extract_error_text(result) or "STATUS_UNAVAILABLE",
                 "token_auth_state": "unknown",
                 "token_auth_checked_at": None,
@@ -2327,6 +2408,17 @@ class FlowClient:
         manual_disconnect = bool(data.get("manualDisconnect", False))
         flow_key_present = bool(data.get("flowKeyPresent", self._flow_key))
         runtime_connected = agent_connected and not manual_disconnect and state != "off"
+        runtime_instance_id = self._normalize_runtime_instance_id(
+            data.get("runtimeInstanceId") or data.get("runtime_instance_id")
+        )
+        if runtime_instance_id and self._extension_ws is not None:
+            self._ws_runtime_instance[self._extension_ws] = runtime_instance_id
+        preferred_runtime = self._preferred_runtime_instance_id
+        preferred_runtime_mismatch = bool(
+            preferred_runtime and runtime_instance_id and runtime_instance_id != preferred_runtime
+        )
+        if preferred_runtime_mismatch:
+            runtime_connected = False
         return {
             "connected": self.connected,
             "agent_connected": agent_connected,
@@ -2334,6 +2426,9 @@ class FlowClient:
             "state": state,
             "manual_disconnect": manual_disconnect,
             "runtime_connected": runtime_connected,
+            "runtime_instance_id": runtime_instance_id or None,
+            "preferred_runtime_instance_id": preferred_runtime or None,
+            "preferred_runtime_mismatch": preferred_runtime_mismatch,
             "flow_tab_id": data.get("flowTabId"),
             "flow_tab_url": data.get("flowTabUrl"),
             "flow_tab_seen_at": data.get("flowTabSeenAt"),
