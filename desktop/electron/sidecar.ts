@@ -14,6 +14,7 @@ const MAX_RETRIES = 5
 const RESTART_DELAY_MS = 3000
 const HEALTH_POLL_MS = 600
 const HEALTH_TIMEOUT_MS = 20000
+const WS_PORT_CANDIDATES = [9222, 19222, 29222]
 
 class Sidecar extends EventEmitter {
     private process: ChildProcess | null = null
@@ -27,6 +28,16 @@ class Sidecar extends EventEmitter {
         this.stopping = false
         // If port is already occupied by an external instance, adopt only if compatible.
         const alreadyUp = await this._checkHealth()
+        if (alreadyUp && app.isPackaged && process.platform === 'win32') {
+            console.warn('[sidecar] Windows packaged build: forcing sidecar ownership on :8100')
+            const replaced = await this._replaceIncompatibleProcess()
+            if (!replaced) {
+                this.emit('status', 'Error — port 8100 occupied by incompatible process')
+                return
+            }
+            this._spawn()
+            return
+        }
         if (alreadyUp) {
             const compatible = await this._checkCompatibility()
             if (compatible) {
@@ -81,6 +92,10 @@ class Sidecar extends EventEmitter {
         this.emit('status', 'Starting...')
 
         const sidecarEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }
+        const wsPort = this._chooseAvailableWsPort()
+        sidecarEnv.WS_PORT = String(wsPort)
+        sidecarEnv.WS_PORT_CANDIDATES = WS_PORT_CANDIDATES.join(',')
+        console.log('[sidecar] WS bridge port:', wsPort)
         this._injectLocalUpscaleRuntimeEnv(sidecarEnv)
 
         this.process = spawn(bin, args, {
@@ -221,7 +236,17 @@ class Sidecar extends EventEmitter {
     private async _checkHealth(): Promise<boolean> {
         try {
             const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(1500) })
-            return res.ok
+            if (!res.ok) return false
+            const payload = await res.json().catch(() => null) as {
+                status?: string
+                ws_server_listening?: boolean
+            } | null
+            if (!payload) return true
+            const statusOk = String(payload.status || '').toLowerCase() === 'ok'
+            const wsListening = payload.ws_server_listening === undefined
+                ? true
+                : Boolean(payload.ws_server_listening)
+            return statusOk && wsListening
         } catch {
             return false
         }
@@ -399,7 +424,12 @@ class Sidecar extends EventEmitter {
         if (!lower) return false
 
         if (app.isPackaged) {
-            return lower.includes('flowkit-agent')
+            const ext = process.platform === 'win32' ? '.exe' : ''
+            const expected = join(process.resourcesPath, 'agent', `flowkit-agent${ext}`)
+                .toLowerCase()
+                .replace(/\\/g, '/')
+            const normalized = lower.replace(/\\/g, '/')
+            return normalized.includes(expected)
         }
 
         const projectRoot = join(__dirname, '../../..')
@@ -513,6 +543,14 @@ class Sidecar extends EventEmitter {
         }
 
         console.log('[sidecar] Local upscale runtime root:', chosenRoot)
+    }
+
+    private _chooseAvailableWsPort(): number {
+        for (const port of WS_PORT_CANDIDATES) {
+            const pids = this._listListeningPids(port)
+            if (pids.length === 0) return port
+        }
+        return WS_PORT_CANDIDATES[0]
     }
 }
 

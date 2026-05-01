@@ -570,7 +570,11 @@ class FlowClient:
 
     @property
     def connected(self) -> bool:
-        return self._extension_ws is not None
+        if self._extension_ws is None:
+            self._extension_ws = self._choose_live_ws()
+        elif getattr(self._extension_ws, "closed", False):
+            self.clear_extension(self._extension_ws)
+        return self._extension_ws is not None and not getattr(self._extension_ws, "closed", False)
 
     @property
     def ws_stats(self) -> dict:

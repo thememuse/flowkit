@@ -9,7 +9,7 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.config import API_HOST, API_PORT, WS_HOST, WS_PORT
+from agent.config import API_HOST, API_PORT, WS_HOST, WS_PORT, WS_PORT_CANDIDATES
 from agent.db.schema import init_db, close_db
 from agent.api.characters import router as characters_router
 from agent.api.projects import router as projects_router
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ─── WebSocket Server for Extension ─────────────────────────
 _ws_listener_active = False
+_ws_listener_port: int | None = None
 
 async def ws_handler(websocket):
     """Handle a Chrome extension WebSocket connection."""
@@ -68,19 +69,42 @@ async def run_ws_server():
     Keep retrying so temporary bind/runtime errors don't leave the extension
     permanently disconnected while API server is still alive.
     """
-    global _ws_listener_active
+    global _ws_listener_active, _ws_listener_port
     retry_delay_sec = 2
+    port_candidates = [WS_PORT, *[p for p in WS_PORT_CANDIDATES if p != WS_PORT]]
     while True:
+        bound = False
         try:
-            async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
-                _ws_listener_active = True
-                logger.info("WebSocket server listening on ws://%s:%d", WS_HOST, WS_PORT)
-                await asyncio.Future()  # run forever until cancelled
+            for port in port_candidates:
+                try:
+                    async with websockets.serve(ws_handler, WS_HOST, port):
+                        bound = True
+                        _ws_listener_active = True
+                        _ws_listener_port = port
+                        logger.info("WebSocket server listening on ws://%s:%d", WS_HOST, port)
+                        await asyncio.Future()  # run forever until cancelled
+                except OSError as e:
+                    logger.warning("WS bind failed on ws://%s:%d (%s)", WS_HOST, port, e)
+                    continue
+                finally:
+                    _ws_listener_active = False
+                    _ws_listener_port = None
+                # Bound and stopped unexpectedly -> let outer loop handle restart.
+                break
+            if not bound:
+                logger.error(
+                    "WS bind failed on all candidate ports %s. Retrying in %ss",
+                    port_candidates,
+                    retry_delay_sec,
+                )
+                await asyncio.sleep(retry_delay_sec)
         except asyncio.CancelledError:
             _ws_listener_active = False
+            _ws_listener_port = None
             raise
         except Exception as e:
             _ws_listener_active = False
+            _ws_listener_port = None
             logger.exception("WS server crashed (%s). Retrying in %ss", e, retry_delay_sec)
             await asyncio.sleep(retry_delay_sec)
 
@@ -214,6 +238,8 @@ async def health():
         "extension_state": ext_status.get("state"),
         "extension_manual_disconnect": ext_status.get("manual_disconnect"),
         "ws_server_listening": _ws_listener_active,
+        "ws_server_port": _ws_listener_port,
+        "ws_server_candidates": list(WS_PORT_CANDIDATES),
         "ws": client.ws_stats,
     }
 

@@ -5,11 +5,18 @@
  * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-const AGENT_WS_URL = "ws://127.0.0.1:9222";
+const AGENT_HTTP_BASE = "http://127.0.0.1:8100";
+const AGENT_WS_HOST = "127.0.0.1";
+const AGENT_WS_PORTS_DEFAULT = [9222, 19222, 29222];
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY";
 
 let ws = null;
+let wsConnectInFlight = false;
+let wsConnectedPort = null;
+let wsPortCursor = 0;
+let wsPortConfigUpdatedAt = 0;
+let wsPortCandidates = [...AGENT_WS_PORTS_DEFAULT];
 let flowKey = null;
 let callbackSecret = null; // Auth secret for HTTP callback, received from server on WS connect
 let state = "off"; // off | idle | running
@@ -1112,21 +1119,91 @@ async function captureTokenFromFlowTab(projectId = "") {
 
 // ─── WebSocket to Agent ─────────────────────────────────────
 
-function connectToAgent() {
+function parseWsPort(value) {
+  const num = Number.parseInt(String(value || "").trim(), 10);
+  if (!Number.isFinite(num)) return null;
+  if (num <= 0 || num > 65535) return null;
+  return num;
+}
+
+function normalizeWsPorts(values) {
+  const unique = new Set();
+  const out = [];
+  for (const value of values || []) {
+    const port = parseWsPort(value);
+    if (!port || unique.has(port)) continue;
+    unique.add(port);
+    out.push(port);
+  }
+  if (wsConnectedPort && !unique.has(wsConnectedPort)) {
+    unique.add(wsConnectedPort);
+    out.unshift(wsConnectedPort);
+  }
+  for (const fallback of AGENT_WS_PORTS_DEFAULT) {
+    if (!unique.has(fallback)) {
+      unique.add(fallback);
+      out.push(fallback);
+    }
+  }
+  return out;
+}
+
+async function refreshAgentWsPortConfig(force = false) {
+  if (!force && (Date.now() - wsPortConfigUpdatedAt) < 5000) return;
+  try {
+    const response = await fetch(`${AGENT_HTTP_BASE}/health`, {
+      cache: "no-store",
+    });
+    if (!response.ok) return;
+    const payload = await response.json();
+    const preferred = parseWsPort(payload?.ws_server_port);
+    const merged = normalizeWsPorts(payload?.ws_server_candidates || []);
+    if (preferred) {
+      wsPortCandidates = normalizeWsPorts([preferred, ...merged]);
+    } else {
+      wsPortCandidates = normalizeWsPorts(merged);
+    }
+    wsPortConfigUpdatedAt = Date.now();
+  } catch {
+    // keep existing candidates
+  }
+}
+
+function chooseNextWsPort() {
+  const total = wsPortCandidates.length || AGENT_WS_PORTS_DEFAULT.length;
+  if (total <= 0) return 9222;
+  const ports = wsPortCandidates.length
+    ? wsPortCandidates
+    : AGENT_WS_PORTS_DEFAULT;
+  const index = wsPortCursor % ports.length;
+  wsPortCursor = (wsPortCursor + 1) % Math.max(ports.length, 1);
+  return ports[index];
+}
+
+async function connectToAgent() {
   if (manualDisconnect) return;
   if (ws?.readyState === WebSocket.CONNECTING) return;
   if (ws?.readyState === WebSocket.OPEN) return;
+  if (wsConnectInFlight) return;
+
+  wsConnectInFlight = true;
+  await refreshAgentWsPortConfig();
+  const targetPort = chooseNextWsPort();
+  const wsUrl = `ws://${AGENT_WS_HOST}:${targetPort}`;
 
   try {
-    ws = new WebSocket(AGENT_WS_URL);
+    ws = new WebSocket(wsUrl);
   } catch (e) {
-    console.error("[FlowAgent] WS connect error:", e);
+    console.error("[FlowAgent] WS connect error:", e, wsUrl);
+    wsConnectInFlight = false;
     scheduleReconnect();
     return;
   }
+  wsConnectInFlight = false;
 
   ws.onopen = () => {
-    console.log("[FlowAgent] Connected to agent");
+    wsConnectedPort = targetPort;
+    console.log(`[FlowAgent] Connected to agent ${wsUrl}`);
     chrome.alarms.clear("reconnect");
     setState("idle");
 
@@ -1232,6 +1309,8 @@ function connectToAgent() {
             flowTabId: lastFlowTabId,
             flowTabUrl: lastFlowTabUrl || null,
             flowTabSeenAt: lastFlowSeenAt || null,
+            wsPort: wsConnectedPort,
+            wsPortCandidates: wsPortCandidates.slice(0, 6),
             tokenAge: metrics.tokenCapturedAt
               ? Date.now() - metrics.tokenCapturedAt
               : null,
@@ -1257,13 +1336,15 @@ function connectToAgent() {
   };
 
   ws.onclose = () => {
+    ws = null;
     setState("off");
     chrome.alarms.clear("token-refresh");
+    wsPortCursor = (wsPortCursor + 1) % Math.max(wsPortCandidates.length, 1);
     if (!manualDisconnect) scheduleReconnect();
   };
 
   ws.onerror = (e) => {
-    console.error("[FlowAgent] WS error:", e);
+    console.error("[FlowAgent] WS error:", e, wsUrl);
     metrics.lastError = "WS_ERROR";
     chrome.storage.local.set({ metrics });
   };
@@ -1287,7 +1368,7 @@ function keepAlive() {
 function sendToAgent(msg) {
   // API responses (with msg.id) go via HTTP — immune to WS disconnect
   if (msg.id) {
-    fetch("http://127.0.0.1:8100/api/ext/callback", {
+    fetch(`${AGENT_HTTP_BASE}/api/ext/callback`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(msg),
@@ -2509,6 +2590,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       activeProjectId: inferActiveProjectId(),
       flowTabId: lastFlowTabId,
       flowTabSeenAt: lastFlowSeenAt,
+      wsPort: wsConnectedPort,
+      wsPortCandidates: wsPortCandidates.slice(0, 6),
       tokenAge: metrics.tokenCapturedAt
         ? Date.now() - metrics.tokenCapturedAt
         : null,

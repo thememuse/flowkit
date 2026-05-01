@@ -14,6 +14,23 @@ API_PORT = int(os.environ.get("API_PORT", "8100"))
 # ─── WebSocket Server (extension connects here) ─────────────
 WS_HOST = os.environ.get("WS_HOST", "127.0.0.1")
 WS_PORT = int(os.environ.get("WS_PORT", "9222"))
+_WS_PORT_CANDIDATES_RAW = os.environ.get("WS_PORT_CANDIDATES", "9222,19222,29222")
+_WS_PORT_CANDIDATES_LIST: list[int] = []
+for _token in str(_WS_PORT_CANDIDATES_RAW).split(","):
+    _text = str(_token).strip()
+    if not _text:
+        continue
+    try:
+        _port = int(_text)
+    except ValueError:
+        continue
+    if _port <= 0 or _port > 65535:
+        continue
+    if _port not in _WS_PORT_CANDIDATES_LIST:
+        _WS_PORT_CANDIDATES_LIST.append(_port)
+if WS_PORT not in _WS_PORT_CANDIDATES_LIST:
+    _WS_PORT_CANDIDATES_LIST.insert(0, WS_PORT)
+WS_PORT_CANDIDATES = tuple(_WS_PORT_CANDIDATES_LIST)
 
 # ─── Google Flow API ────────────────────────────────────────
 GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
