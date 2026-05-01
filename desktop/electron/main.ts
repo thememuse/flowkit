@@ -804,6 +804,42 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+type HealthProbe = {
+    extension_connected?: boolean
+    extension_ws_connected?: boolean
+}
+
+type FlowStatusProbe = {
+    connected?: boolean
+    agent_connected?: boolean
+    runtime_connected?: boolean
+    state?: string
+    manual_disconnect?: boolean
+    flow_tab_id?: number | null
+    flow_tab_url?: string | null
+}
+
+async function probeExtensionRuntimeReady(): Promise<boolean> {
+    try {
+        const [healthRes, runtimeRes] = await Promise.all([
+            fetch('http://127.0.0.1:8100/health', { signal: AbortSignal.timeout(1500) }),
+            fetch('http://127.0.0.1:8100/api/flow/status', { signal: AbortSignal.timeout(1500) }),
+        ])
+        if (!healthRes.ok || !runtimeRes.ok) return false
+
+        const health = await healthRes.json() as HealthProbe
+        const runtime = await runtimeRes.json() as FlowStatusProbe
+        const wsConnected = Boolean(health.extension_ws_connected ?? health.extension_connected)
+        const runtimeConnected = runtime.runtime_connected !== undefined
+            ? Boolean(runtime.runtime_connected)
+            : Boolean((runtime.connected ?? runtime.agent_connected) && runtime.manual_disconnect !== true && String(runtime.state || '').toLowerCase() !== 'off')
+        const stateReady = String(runtime.state || '').toLowerCase() !== 'off'
+        return wsConnected && runtimeConnected && stateReady
+    } catch {
+        return false
+    }
+}
+
 type ExtensionReconnectResult = {
     ok: boolean
     method?: string
@@ -834,15 +870,7 @@ async function waitForWebContentsReady(webContents: Electron.WebContents | null 
 async function waitForExtensionConnected(timeoutMs = 12000): Promise<boolean> {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
-        try {
-            const res = await fetch('http://127.0.0.1:8100/health', { signal: AbortSignal.timeout(1500) })
-            if (res.ok) {
-                const health = await res.json() as { extension_connected?: boolean }
-                if (Boolean(health?.extension_connected)) return true
-            }
-        } catch {
-            // retry
-        }
+        if (await probeExtensionRuntimeReady()) return true
         await sleep(500)
     }
     return false
@@ -902,8 +930,7 @@ async function performExtensionReconnect(): Promise<ExtensionReconnectResult> {
         }
 
         // Find the extension background service worker webContents
-        const allContents = (session.defaultSession as any).getAllWebContents?.()
-            ?? require('electron').webContents.getAllWebContents()
+        const allContents = require('electron').webContents.getAllWebContents()
         const bgContents = allContents.find((wc: Electron.WebContents) => {
             const url = wc.getURL?.() ?? ''
             return flowExtensionId
@@ -962,17 +989,9 @@ function scheduleExtensionAutoReconnect(reason: string, delayMs = 800) {
         if (extensionAutoReconnectInFlight || licenseRevokedLockdown) return
         extensionAutoReconnectInFlight = true
         try {
-            try {
-                const healthRes = await fetch('http://127.0.0.1:8100/health', { signal: AbortSignal.timeout(1500) })
-                if (healthRes.ok) {
-                    const health = await healthRes.json() as { extension_connected?: boolean }
-                    if (Boolean(health?.extension_connected)) {
-                        extensionAutoReconnectAttempts = 0
-                        return
-                    }
-                }
-            } catch {
-                // health probe failed, continue reconnect attempts
+            if (await probeExtensionRuntimeReady()) {
+                extensionAutoReconnectAttempts = 0
+                return
             }
 
             extensionAutoReconnectAttempts += 1
