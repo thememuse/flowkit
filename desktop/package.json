@@ -4,6 +4,10 @@
     "description": "FlowKit Desktop — AI Video Generation",
     "main": "out/main/main.js",
     "private": true,
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/thememuse/flowkit.git"
+    },
     "scripts": {
         "dev": "electron-vite dev",
         "build": "electron-vite build",

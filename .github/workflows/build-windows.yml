@@ -15,6 +15,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            agent
+            desktop
+            extension
+            requirements.txt
+          sparse-checkout-cone-mode: false
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -71,8 +78,6 @@ jobs:
       - name: Build Electron app (Windows)
         working-directory: desktop
         run: npm run build:win
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
