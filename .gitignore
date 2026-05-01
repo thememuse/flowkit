@@ -8,6 +8,8 @@ __pycache__/
 output/
 youtube
 agent/active_project.json
+.pytest_cache/
+venv/
 
 # Generated AI tool configs (run: python setup.py)
 .claude/commands/fk:*
@@ -15,3 +17,18 @@ agent/active_project.json
 AGENTS.md
 GEMINI.md
 .fk-setup.json
+
+# OS / local machine
+.DS_Store
+.agent/
+
+# Node / Electron build artifacts
+node_modules/
+cloudflare-license/node_modules/
+desktop/node_modules/
+desktop/dist/
+desktop/dist-electron/
+desktop/out/
+desktop/resources/agent/
+build-artifacts/
+release-assets/
