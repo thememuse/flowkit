@@ -13,7 +13,7 @@ interface Props {
     onClose: () => void
 }
 
-type ReviewAction = 'ok' | 'regen-img' | 'regen-vid' | 'edit'
+type ReviewAction = 'ok' | 'edit'
 
 interface SceneFeedback {
     action: ReviewAction
@@ -79,26 +79,6 @@ export default function ReviewBoardModal({ projectId, videoId, orientation, onCl
                 const fb = feedback[scene.id]
                 if (!fb || fb.action === 'ok') continue
 
-                if (fb.action === 'regen-img') {
-                    requests.push({
-                        type: 'REGENERATE_IMAGE',
-                        project_id: projectId,
-                        video_id: videoId,
-                        scene_id: scene.id,
-                        orientation: ori,
-                    })
-                }
-
-                if (fb.action === 'regen-vid') {
-                    requests.push({
-                        type: 'REGENERATE_VIDEO',
-                        project_id: projectId,
-                        video_id: videoId,
-                        scene_id: scene.id,
-                        orientation: ori,
-                    })
-                }
-
                 if (fb.action === 'edit') {
                     if (fb.note.trim()) {
                         await patchAPI(`/api/scenes/${scene.id}`, {
@@ -129,7 +109,7 @@ export default function ReviewBoardModal({ projectId, videoId, orientation, onCl
     }
 
     const summary = useMemo(() => {
-        const counts: Record<ReviewAction, number> = { ok: 0, 'regen-img': 0, 'regen-vid': 0, edit: 0 }
+        const counts: Record<ReviewAction, number> = { ok: 0, edit: 0 }
         Object.values(feedback).forEach(f => { counts[f.action] += 1 })
         return counts
     }, [feedback])
@@ -143,8 +123,6 @@ export default function ReviewBoardModal({ projectId, videoId, orientation, onCl
 
                 <div className="flex flex-wrap items-center gap-3 text-xs" style={{ color: 'var(--muted)' }}>
                     <span>OK: {summary.ok}</span>
-                    <span>Regen Image: {summary['regen-img']}</span>
-                    <span>Regen Video: {summary['regen-vid']}</span>
                     <span>Edit: {summary.edit}</span>
                     <div className="flex-1" />
                     <ActionButton variant="ghost" size="sm" onClick={exportJson}><Download size={11} /> Export JSON</ActionButton>
@@ -185,8 +163,6 @@ export default function ReviewBoardModal({ projectId, videoId, orientation, onCl
 
                                 <select value={fb.action} onChange={e => setAction(scene.id, e.target.value as ReviewAction)} className="input">
                                     <option value="ok">OK</option>
-                                    <option value="regen-img">Regen Image</option>
-                                    <option value="regen-vid">Regen Video</option>
                                     <option value="edit">Edit Image (with note)</option>
                                 </select>
 

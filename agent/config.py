@@ -3,6 +3,11 @@ import json
 import os
 from pathlib import Path
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = str(os.environ.get(name, default)).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 # ─── Paths ───────────────────────────────────────────────────
 BASE_DIR = Path(os.environ.get("FLOW_AGENT_DIR", Path(__file__).parent.parent))
 DB_PATH = BASE_DIR / "flow_agent.db"
@@ -39,28 +44,38 @@ RECAPTCHA_SITE_KEY = os.environ.get("RECAPTCHA_SITE_KEY", "6LdsFiUsAAAAAIjVDZcuL
 
 # ─── Worker ──────────────────────────────────────────────────
 # Stability profile (desktop default):
-# - Keep moderate overall concurrency
-# - Throttle image requests to reduce reCAPTCHA traffic flags
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "1"))
+# - Follow upstream CLI pacing as baseline to avoid Google traffic lockouts.
+# - Queue retries in worker instead of burst retries in extension.
+STRICT_CLI_FLOW_MODE = _env_flag("STRICT_CLI_FLOW_MODE", "1")
+MEDIA_PARALLELISM = max(1, int(os.environ.get("MEDIA_PARALLELISM", "4")))
+CAPTCHA_PARALLELISM = max(
+    1,
+    min(MEDIA_PARALLELISM, int(os.environ.get("CAPTCHA_PARALLELISM", "1")))
+)
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 VIDEO_POLL_INTERVAL = int(os.environ.get("VIDEO_POLL_INTERVAL", "15"))  # polling interval for video/upscale status
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 VIDEO_POLL_TIMEOUT = int(os.environ.get("VIDEO_POLL_TIMEOUT", "420"))
-API_COOLDOWN = float(os.environ.get("API_COOLDOWN", "1"))  # seconds between API calls
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "4"))
+API_COOLDOWN = float(os.environ.get("API_COOLDOWN", "0"))  # seconds between API calls
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", str(MEDIA_PARALLELISM)))
 # All Flow generation requests consume reCAPTCHA budget.
 # Keep this conservative to avoid unusual-traffic lockouts.
-MAX_CONCURRENT_CAPTCHA_REQUESTS = int(os.environ.get("MAX_CONCURRENT_CAPTCHA_REQUESTS", "1"))
+MAX_CONCURRENT_CAPTCHA_REQUESTS = int(
+    os.environ.get("MAX_CONCURRENT_CAPTCHA_REQUESTS", str(CAPTCHA_PARALLELISM))
+)
 CAPTCHA_API_COOLDOWN = float(os.environ.get("CAPTCHA_API_COOLDOWN", "10"))  # minimum gap between captcha-consuming API calls
-MAX_CONCURRENT_IMAGE_REQUESTS = int(os.environ.get("MAX_CONCURRENT_IMAGE_REQUESTS", "1"))
-IMAGE_API_COOLDOWN = float(os.environ.get("IMAGE_API_COOLDOWN", "12"))  # minimum gap between image/edit requests
+MAX_CONCURRENT_IMAGE_REQUESTS = int(os.environ.get("MAX_CONCURRENT_IMAGE_REQUESTS", str(MEDIA_PARALLELISM)))
+IMAGE_API_COOLDOWN = float(os.environ.get("IMAGE_API_COOLDOWN", "10"))  # minimum gap between image/edit requests
 # Video queue can run in parallel without overloading captcha as heavily as image generation.
-MAX_CONCURRENT_VIDEO_REQUESTS = int(os.environ.get("MAX_CONCURRENT_VIDEO_REQUESTS", "4"))
-VIDEO_API_COOLDOWN = float(os.environ.get("VIDEO_API_COOLDOWN", "1"))  # min gap for video submit/status jobs
+MAX_CONCURRENT_VIDEO_REQUESTS = int(os.environ.get("MAX_CONCURRENT_VIDEO_REQUESTS", str(MEDIA_PARALLELISM)))
+VIDEO_API_COOLDOWN = float(os.environ.get("VIDEO_API_COOLDOWN", "10"))  # min gap for video submit jobs
 # Local 4K upscale is CPU/GPU intensive; keep strict concurrency by default.
 MAX_CONCURRENT_LOCAL_UPSCALE_REQUESTS = int(os.environ.get("MAX_CONCURRENT_LOCAL_UPSCALE_REQUESTS", "1"))
 # Ref stage (character + location) can run slightly faster than scene image stage.
-MAX_CONCURRENT_CHARACTER_REF_REQUESTS = int(os.environ.get("MAX_CONCURRENT_CHARACTER_REF_REQUESTS", "2"))
-CHARACTER_IMAGE_API_COOLDOWN = float(os.environ.get("CHARACTER_IMAGE_API_COOLDOWN", "5"))  # min gap for character/location ref ops
+MAX_CONCURRENT_CHARACTER_REF_REQUESTS = int(
+    os.environ.get("MAX_CONCURRENT_CHARACTER_REF_REQUESTS", str(MEDIA_PARALLELISM))
+)
+CHARACTER_IMAGE_API_COOLDOWN = float(os.environ.get("CHARACTER_IMAGE_API_COOLDOWN", "10"))  # min gap for character/location ref ops
 CAPTCHA_RETRY_LIMIT = int(os.environ.get("CAPTCHA_RETRY_LIMIT", "10"))
 CAPTCHA_RETRY_BACKOFF_BASE = int(os.environ.get("CAPTCHA_RETRY_BACKOFF_BASE", "45"))  # seconds
 CAPTCHA_RETRY_BACKOFF_MAX = int(os.environ.get("CAPTCHA_RETRY_BACKOFF_MAX", "1800"))  # seconds

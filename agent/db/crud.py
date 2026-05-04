@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from agent.db.schema import get_db, _db_lock
+from agent.utils.orientation import normalize_orientation
 
 logger = logging.getLogger(__name__)
 
@@ -281,17 +282,104 @@ async def clear_redirect_media_urls() -> dict:
 
 # ─── Request ────────────────────────────────────────────────
 
+_REQUEST_STAGE_BY_TYPE: dict[str, str] = {
+    "GENERATE_CHARACTER_IMAGE": "character_image",
+    "REGENERATE_CHARACTER_IMAGE": "character_image",
+    "EDIT_CHARACTER_IMAGE": "character_image",
+    "GENERATE_IMAGE": "scene_image",
+    "REGENERATE_IMAGE": "scene_image",
+    "EDIT_IMAGE": "scene_image",
+    "GENERATE_VIDEO": "scene_video",
+    "REGENERATE_VIDEO": "scene_video",
+    "GENERATE_VIDEO_REFS": "scene_video",
+    "UPSCALE_VIDEO": "scene_upscale",
+    "UPSCALE_VIDEO_LOCAL": "scene_upscale",
+}
+
+
+def _request_stage(req_type: str | None) -> str:
+    key = str(req_type or "")
+    return _REQUEST_STAGE_BY_TYPE.get(key, key)
+
+
+def _same_request_stage(
+    row: dict,
+    *,
+    req_type: str,
+    scene_id: str | None,
+    character_id: str | None,
+    orientation: str | None,
+) -> bool:
+    if _request_stage(row.get("type")) != _request_stage(req_type):
+        return False
+    if scene_id:
+        if row.get("scene_id") != scene_id:
+            return False
+        req_orient = normalize_orientation(orientation) if orientation else "NONE"
+        row_orient = normalize_orientation(row.get("orientation")) if row.get("orientation") else "NONE"
+        return req_orient == row_orient
+    if character_id:
+        return row.get("character_id") == character_id
+    return False
+
 async def create_request(req_type: str, orientation: str = None,
                          scene_id: str = None, character_id: str = None,
                          project_id: str = None, video_id: str = None,
                          source_media_id: str = None, **_kw) -> dict:
     db = await get_db()
     rid, now = _uuid(), _now()
+    normalized_orientation = normalize_orientation(orientation) if orientation else orientation
     async with _db_lock:
+        # Idempotency by logical stage: avoid duplicate PENDING/PROCESSING rows
+        # such as GENERATE vs REGENERATE for the same scene/character.
+        active_rows: list[dict] = []
+        if scene_id:
+            cur = await db.execute(
+                """
+                SELECT * FROM request
+                WHERE scene_id=? AND status IN ('PENDING','PROCESSING')
+                ORDER BY updated_at DESC
+                """,
+                (scene_id,),
+            )
+            active_rows = [dict(r) for r in await cur.fetchall()]
+        elif character_id:
+            cur = await db.execute(
+                """
+                SELECT * FROM request
+                WHERE character_id=? AND status IN ('PENDING','PROCESSING')
+                ORDER BY updated_at DESC
+                """,
+                (character_id,),
+            )
+            active_rows = [dict(r) for r in await cur.fetchall()]
+
+        for row in active_rows:
+            if _same_request_stage(
+                row,
+                req_type=req_type,
+                scene_id=scene_id,
+                character_id=character_id,
+                orientation=normalized_orientation,
+            ):
+                return row
+
         await db.execute(
             """INSERT INTO request (id,project_id,video_id,scene_id,character_id,type,orientation,source_media_id,created_at,updated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (rid, project_id, video_id, scene_id, character_id, req_type, orientation, source_media_id, now, now))
+            (
+                rid,
+                project_id,
+                video_id,
+                scene_id,
+                character_id,
+                req_type,
+                normalized_orientation,
+                source_media_id,
+                now,
+                now,
+            ),
+        )
         await db.commit()
     return await _get_with_db(db, "request", "id", rid)
 
@@ -380,9 +468,9 @@ async def list_actionable_requests(exclude_ids: set[str] = None, limit: int = 5)
           AND (next_retry_at IS NULL OR next_retry_at <= ?)
         ORDER BY
           CASE
-            WHEN type IN ('GENERATE_VIDEO','REGENERATE_VIDEO','GENERATE_VIDEO_REFS','UPSCALE_VIDEO')
-              AND request_id IS NOT NULL THEN 1
-            ELSE 0
+            WHEN type IN ('GENERATE_VIDEO','REGENERATE_VIDEO','GENERATE_VIDEO_REFS','UPSCALE_VIDEO','UPSCALE_VIDEO_LOCAL')
+              AND request_id IS NOT NULL THEN 0
+            ELSE 1
           END,
           CASE type
             WHEN 'GENERATE_CHARACTER_IMAGE' THEN 0

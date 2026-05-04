@@ -121,6 +121,42 @@ window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
   }
 });
 
+window.addEventListener('FLOW_API_REQUEST', async ({ detail }) => {
+  const requestId = detail?.requestId;
+  const targetUrl = String(detail?.url || '');
+  const method = String(detail?.method || 'GET').toUpperCase();
+  const headers = detail?.headers && typeof detail.headers === 'object' ? detail.headers : {};
+  const payload = detail?.body ?? null;
+
+  try {
+    const body =
+      method === 'GET'
+        ? undefined
+        : (typeof payload === 'string' ? payload : JSON.stringify(payload || {}));
+    const response = await fetch(targetUrl, {
+      method,
+      headers,
+      credentials: 'include',
+      body,
+    });
+    const text = await response.text();
+    window.dispatchEvent(new CustomEvent('FLOW_API_RESULT', {
+      detail: {
+        requestId,
+        status: response.status,
+        text,
+      },
+    }));
+  } catch (e) {
+    window.dispatchEvent(new CustomEvent('FLOW_API_RESULT', {
+      detail: {
+        requestId,
+        error: e?.message || 'FLOW_API_FAILED',
+      },
+    }));
+  }
+});
+
 function waitForGrecaptcha(timeout = 10000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();

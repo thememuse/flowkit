@@ -43,6 +43,7 @@ from agent.config import (
     REQUEST_DISPATCH_TIMEOUT,
     VIDEO_POLL_TIMEOUT,
     STALE_PENDING_LOCAL_UPSCALE_TIMEOUT,
+    STRICT_CLI_FLOW_MODE,
 )
 from agent.worker._parsing import _is_error
 from agent.sdk.services.result_handler import parse_result, apply_scene_result, apply_character_result
@@ -87,8 +88,24 @@ _TYPE_PRIORITY = {
     "UPSCALE_VIDEO": 3, "UPSCALE_VIDEO_LOCAL": 3,
 }
 
+_STAGE_KEY_BY_TYPE = {
+    "GENERATE_CHARACTER_IMAGE": "character_image",
+    "REGENERATE_CHARACTER_IMAGE": "character_image",
+    "EDIT_CHARACTER_IMAGE": "character_image",
+    "GENERATE_IMAGE": "scene_image",
+    "REGENERATE_IMAGE": "scene_image",
+    "EDIT_IMAGE": "scene_image",
+    "GENERATE_VIDEO": "scene_video",
+    "REGENERATE_VIDEO": "scene_video",
+    "GENERATE_VIDEO_REFS": "scene_video",
+    "UPSCALE_VIDEO": "scene_upscale",
+    "UPSCALE_VIDEO_LOCAL": "scene_upscale",
+}
+
 _OP_NAME_RE = re.compile(r"Operation failed:\s*([A-Za-z0-9_-]+)")
+_SUBMIT_PENDING_PREFIX = "submit_pending_until:"
 _LOCAL_UPSCALE_SETUP_MARKER = "local_upscale_setup_required"
+_TRAFFIC_COOLDOWN_RE = re.compile(r"traffic cooldown active\s+(\d+)s")
 
 # Backward-compatible module-level retry map used by unit tests and as
 # fallback state when _handle_failure is called without explicit retry dict.
@@ -100,15 +117,119 @@ def _iso_after(seconds: float) -> str:
     return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _extract_data_error_message(data: object, status: int | None = None) -> str:
+    """Extract best-effort detailed message from response data payload."""
+    message = ""
+
+    if isinstance(data, dict):
+        raw_error = data.get("error")
+        if isinstance(raw_error, dict):
+            message = str(raw_error.get("message") or "").strip()
+            details = raw_error.get("details")
+            if not message:
+                message = json.dumps(raw_error, ensure_ascii=False)[:240]
+            if isinstance(details, list):
+                for item in details:
+                    if isinstance(item, dict):
+                        reason = str(item.get("reason") or "").strip()
+                        if reason:
+                            message = f"{message} [{reason}]".strip()
+                            break
+        elif raw_error:
+            message = str(raw_error).strip()
+        else:
+            fallback_fields = ("message", "detail", "details")
+            for field in fallback_fields:
+                val = data.get(field)
+                if val:
+                    message = str(val).strip()
+                    break
+            if not message:
+                data_text = str(data).strip()
+                if data_text and data_text not in ("{}", "[]", "null", "None"):
+                    message = data_text[:240]
+    elif isinstance(data, str):
+        text = data.strip()
+        if text:
+            low = text.lower()
+            if (
+                "<title>sorry" in low
+                or "our systems have detected unusual traffic" in low
+                or "/sorry/" in low
+            ):
+                if isinstance(status, int) and status >= 400:
+                    return f"API_{status}: GOOGLE_SORRY_PAGE (unusual traffic)"
+                return "GOOGLE_SORRY_PAGE (unusual traffic)"
+            message = text[:240]
+
+    if message:
+        return message
+    return ""
+
+
+def _extract_failure_message(result: dict) -> str:
+    """Normalize error text from extension/API payloads.
+
+    Guarantees a non-empty message and preserves HTTP status hints
+    (`API_403`, `API_500`, ...) instead of collapsing into "Unknown error".
+    """
+    if not isinstance(result, dict):
+        text = str(result).strip()
+        return text or "Unknown error"
+
+    status = result.get("status")
+    data = result.get("data")
+    explicit_error = str(result.get("error") or "").strip()
+    detail_message = _extract_data_error_message(data, status if isinstance(status, int) else None)
+
+    if explicit_error and detail_message:
+        exp_low = explicit_error.lower()
+        det_low = detail_message.lower()
+        if "api_403: google_sorry_page" in exp_low or "api_403: recaptcha_blocked" in exp_low:
+            return explicit_error
+        if det_low not in exp_low:
+            if exp_low.startswith("api_"):
+                return f"{explicit_error}: {detail_message}"
+            return f"{explicit_error} | {detail_message}"
+
+    if explicit_error:
+        return explicit_error
+
+    if detail_message:
+        return detail_message
+
+    if isinstance(status, int) and status >= 400:
+        return f"API_{status}"
+
+    return "Unknown error"
+
+
+def _request_scheduler_key(req: dict) -> str:
+    req_type = str(req.get("type") or "")
+    stage = _STAGE_KEY_BY_TYPE.get(req_type, req_type or "unknown")
+    scene_id = str(req.get("scene_id") or "").strip()
+    character_id = str(req.get("character_id") or "").strip()
+    orientation = normalize_orientation(req.get("orientation")) if req.get("orientation") else "NONE"
+    if scene_id:
+        return f"scene:{scene_id}:{stage}:{orientation}"
+    if character_id:
+        return f"character:{character_id}:{stage}"
+    req_id = str(req.get("id") or "")
+    return f"request:{req_id}:{stage}"
+
+
 def _is_flow_tab_unavailable_error(error_lower: str) -> bool:
     if not error_lower:
         return False
     markers = (
         "no_flow_tab",
         "no flow tab",
+        "flow_tab_context_required",
+        "flow tab context required",
         "flow_tab_not_ready",
         "flow tab not ready",
         "flow tab unavailable",
+        "failed to fetch",
         "cannot access contents of the page",
         "must request permission to access the respective host",
         "grecaptcha not available",
@@ -136,6 +257,9 @@ def _is_unusual_traffic_error(error_lower: str) -> bool:
         "too_much_traffic",
         "too much traffic",
         "unusual activity",
+        "google_sorry_page",
+        "our systems have detected unusual traffic",
+        "<title>sorry",
     )
     return any(marker in error_lower for marker in markers)
 
@@ -147,6 +271,77 @@ def _is_captcha_timeout_error(error_lower: str) -> bool:
         "timed out",
     )
     return any(marker in error_lower for marker in markers)
+
+
+def _is_quota_or_model_access_error(error_lower: str) -> bool:
+    if not error_lower:
+        return False
+    markers = (
+        "public_error_user_quota_reached",
+        "public_error_per_model_daily_quota_reached",
+        "resource has been exhausted",
+        "quota reached",
+        "public_error_model_access_denied",
+        "model_access_denied",
+        "does not have permission",
+    )
+    return any(marker in error_lower for marker in markers)
+
+
+def _is_generic_api_403_error(error_lower: str) -> bool:
+    """HTTP 403 without explicit captcha/traffic/quota/model markers."""
+    if not error_lower:
+        return False
+    if "api_403" not in error_lower:
+        return False
+    if "captcha" in error_lower or "recaptcha" in error_lower:
+        return False
+    if _is_unusual_traffic_error(error_lower):
+        return False
+    if _is_quota_or_model_access_error(error_lower):
+        return False
+    return True
+
+
+async def _defer_pending_captcha_requests(
+    delay_sec: int,
+    reason: str,
+    *,
+    exclude_id: str | None = None,
+) -> int:
+    """Bulk-defer pending captcha-consuming requests to stop retry storms."""
+    try:
+        pending = await crud.list_pending_requests()
+    except Exception:
+        return 0
+
+    if not pending:
+        return 0
+
+    base_delay = max(15, int(delay_sec))
+    updated = 0
+    slot = 0
+    for row in pending:
+        rid = row.get("id")
+        if not rid or (exclude_id and rid == exclude_id):
+            continue
+        req_type = row.get("type", "")
+        if req_type not in _CAPTCHA_CALL_TYPES:
+            continue
+        # Stagger wake-up times to avoid retry storms when cooldown expires.
+        spread = min(300, slot * 6)
+        until = _iso_after(base_delay + spread)
+        try:
+            await crud.update_request(
+                rid,
+                next_retry_at=until,
+                error_message=reason,
+            )
+            updated += 1
+            slot += 1
+        except Exception:
+            continue
+    return updated
 
 
 class APIRateLimiter:
@@ -168,7 +363,7 @@ class APIRateLimiter:
         await self._semaphore.acquire()
         global_cooldown = self._cooldown
         if req_type in _CHARACTER_IMAGE_CALL_TYPES:
-            global_cooldown = min(self._cooldown, self._character_image_cooldown)
+            global_cooldown = max(self._cooldown, self._character_image_cooldown)
         async with self._gate:
             elapsed = time.monotonic() - self._last_call
             if elapsed < global_cooldown:
@@ -222,27 +417,24 @@ class WorkerController:
         image_cooldown_until = self._group_retry_after.get("image_cooldown_until", 0.0)
         character_image_cooldown_until = self._group_retry_after.get("character_image_cooldown_until", 0.0)
         if req_type in _CAPTCHA_CALL_TYPES:
-            if req_type in _VIDEO_CALL_TYPES:
+            if STRICT_CLI_FLOW_MODE:
+                if (
+                    captcha_pause_until > now
+                    or captcha_cooldown_until > now
+                    or video_cooldown_until > now
+                ):
+                    return False
+            elif req_type in _VIDEO_CALL_TYPES:
                 if captcha_pause_until > now or video_cooldown_until > now:
                     return False
             elif captcha_pause_until > now or captcha_cooldown_until > now:
                 return False
             captcha_active = sum(1 for t in self._active_types.values() if t in _CAPTCHA_CALL_TYPES)
-            captcha_non_char_active = sum(
-                1 for t in self._active_types.values()
-                if t in _CAPTCHA_CALL_TYPES and t not in _CHARACTER_IMAGE_CALL_TYPES
-            )
             max_captcha_concurrency = MAX_CONCURRENT_CAPTCHA_REQUESTS
-            if req_type in _VIDEO_CALL_TYPES:
+            if req_type in _VIDEO_CALL_TYPES and not STRICT_CLI_FLOW_MODE:
                 max_captcha_concurrency = max(
                     max_captcha_concurrency,
                     min(MAX_CONCURRENT_VIDEO_REQUESTS, MAX_CONCURRENT_REQUESTS),
-                )
-            if req_type in _CHARACTER_IMAGE_CALL_TYPES and captcha_non_char_active == 0:
-                # Ref stage (character/location) can burst slightly faster when no scene jobs are active.
-                max_captcha_concurrency = max(
-                    max_captcha_concurrency,
-                    min(MAX_CONCURRENT_CHARACTER_REF_REQUESTS, 2),
                 )
             if safe_mode and req_type in _IMAGE_CALL_TYPES:
                 max_captcha_concurrency = min(max_captcha_concurrency, 1)
@@ -257,7 +449,8 @@ class WorkerController:
                 if local_upscale_active >= max(1, MAX_CONCURRENT_LOCAL_UPSCALE_REQUESTS):
                     return False
             video_active = sum(1 for t in self._active_types.values() if t in _VIDEO_CALL_TYPES)
-            if video_active >= max(1, MAX_CONCURRENT_VIDEO_REQUESTS):
+            max_video_concurrency = max(1, MAX_CONCURRENT_VIDEO_REQUESTS)
+            if video_active >= max_video_concurrency:
                 return False
 
         if req_type in _CHARACTER_IMAGE_CALL_TYPES:
@@ -323,6 +516,16 @@ class WorkerController:
                 logger.warning("Stale request reset: %s type=%s", req["id"][:8], req.get("type"))
             if stale:
                 logger.info("Cleaned up %d stale PROCESSING requests", len(stale))
+            pending = await crud.list_requests(status="PENDING")
+            healed = 0
+            for req in pending or []:
+                try:
+                    await _mark_scene_pending(req, status="PENDING")
+                    healed += 1
+                except Exception:
+                    continue
+            if healed:
+                logger.info("Healed %d pending request scene statuses to PENDING", healed)
         except Exception as e:
             logger.warning("Could not clean up stale requests: %s", e)
 
@@ -338,13 +541,46 @@ class WorkerController:
                 now = time.time()
                 slots_available = MAX_CONCURRENT_REQUESTS - len(self._active_ids)
                 if slots_available <= 0:
-                    await asyncio.sleep(POLL_INTERVAL)
+                    # Keep scheduler reactive while active jobs are running.
+                    await asyncio.sleep(1)
                     continue
 
                 pending = await crud.list_actionable_requests(
                     exclude_ids=self._active_ids,
                     limit=max(25, slots_available * 8),
                 )
+                if pending:
+                    latest_by_key: dict[str, dict] = {}
+                    dup_rows: list[dict] = []
+                    for row in pending:
+                        key = _request_scheduler_key(row)
+                        prev = latest_by_key.get(key)
+                        if not prev:
+                            latest_by_key[key] = row
+                            continue
+                        prev_ts = prev.get("updated_at") or prev.get("created_at") or ""
+                        cur_ts = row.get("updated_at") or row.get("created_at") or ""
+                        if cur_ts >= prev_ts:
+                            dup_rows.append(prev)
+                            latest_by_key[key] = row
+                        else:
+                            dup_rows.append(row)
+                    pending = list(latest_by_key.values())
+                    if dup_rows:
+                        for dup in dup_rows:
+                            rid = dup.get("id")
+                            if not rid:
+                                continue
+                            try:
+                                await crud.update_request(
+                                    rid,
+                                    status="FAILED",
+                                    next_retry_at=None,
+                                    error_message="deduped duplicate pending request",
+                                )
+                            except Exception:
+                                continue
+                        logger.info("Worker deduped %d duplicate pending request(s)", len(dup_rows))
 
                 pending_count = len(pending)
                 await event_bus.emit("worker_tick", {
@@ -357,10 +593,17 @@ class WorkerController:
                     logger.info("Worker: %d actionable, %d active, %d slots",
                                 len(pending), len(self._active_ids), slots_available)
 
+                scheduled_count = 0
+                skipped_by_gate = 0
+                skipped_by_defer = 0
+                scheduled_keys: set[str] = set()
                 for req in pending:
                     if slots_available <= 0:
                         break
                     rid = req["id"]
+                    req_key = _request_scheduler_key(req)
+                    if req_key in scheduled_keys:
+                        continue
 
                     # Skip in-flight
                     if rid in self._active_ids:
@@ -368,10 +611,12 @@ class WorkerController:
 
                     # Respect stricter image throttle + temporary captcha pause window
                     if not self._can_schedule(req, now):
+                        skipped_by_gate += 1
                         continue
 
                     # Skip recently deferred (prereq or retry cooldown)
                     if rid in self._deferred and self._deferred[rid] > now:
+                        skipped_by_defer += 1
                         continue
                     self._deferred.pop(rid, None)
 
@@ -382,6 +627,7 @@ class WorkerController:
 
                     self._active_ids.add(rid)
                     self._active_types[rid] = req.get("type", "")
+                    scheduled_keys.add(req_key)
                     if req.get("type", "") in _IMAGE_CALL_TYPES:
                         cooldown_key = "image_cooldown_until"
                         cooldown_sec = IMAGE_API_COOLDOWN
@@ -396,14 +642,21 @@ class WorkerController:
                                 now + cooldown_sec,
                             )
                     if req.get("type", "") in _CAPTCHA_CALL_TYPES:
-                        if req.get("type", "") in _VIDEO_CALL_TYPES:
+                        if STRICT_CLI_FLOW_MODE:
+                            cooldown_key = "captcha_cooldown_until"
+                            cooldown_sec = max(CAPTCHA_API_COOLDOWN, VIDEO_API_COOLDOWN)
+                            if req.get("type", "") in _IMAGE_CALL_TYPES:
+                                cooldown_sec = max(cooldown_sec, IMAGE_API_COOLDOWN)
+                            if req.get("type", "") in _CHARACTER_IMAGE_CALL_TYPES:
+                                cooldown_sec = max(cooldown_sec, CHARACTER_IMAGE_API_COOLDOWN)
+                        elif req.get("type", "") in _VIDEO_CALL_TYPES:
                             cooldown_key = "video_cooldown_until"
                             cooldown_sec = VIDEO_API_COOLDOWN
                         else:
                             cooldown_key = "captcha_cooldown_until"
                             cooldown_sec = CAPTCHA_API_COOLDOWN
                         if req.get("type", "") in _CHARACTER_IMAGE_CALL_TYPES:
-                            cooldown_sec = min(cooldown_sec, CHARACTER_IMAGE_API_COOLDOWN)
+                            cooldown_sec = max(cooldown_sec, CHARACTER_IMAGE_API_COOLDOWN)
                         if self._image_safe_mode_active(now) and req.get("type", "") in _IMAGE_CALL_TYPES:
                             cooldown_sec = max(cooldown_sec, CAPTCHA_SAFE_MODE_IMAGE_COOLDOWN)
                         if cooldown_sec > 0:
@@ -412,7 +665,25 @@ class WorkerController:
                                 now + cooldown_sec,
                             )
                     slots_available -= 1
+                    scheduled_count += 1
                     asyncio.create_task(self._run_one(req))
+
+                if pending and scheduled_count == 0 and not self._active_ids:
+                    def _left(key: str) -> int:
+                        return max(0, int(self._group_retry_after.get(key, 0.0) - now))
+                    logger.info(
+                        "Worker blocked: gate=%d defer=%d | captcha=%ss image=%ss safe=%ss "
+                        "captcha_cd=%ss image_cd=%ss char_cd=%ss video_cd=%ss",
+                        skipped_by_gate,
+                        skipped_by_defer,
+                        _left("captcha"),
+                        _left("image"),
+                        _left("image_safe_mode_until"),
+                        _left("captcha_cooldown_until"),
+                        _left("image_cooldown_until"),
+                        _left("character_image_cooldown_until"),
+                        _left("video_cooldown_until"),
+                    )
 
                 # Prune stale deferred/retry entries for requests no longer pending
                 pending_ids = {r["id"] for r in pending}
@@ -436,7 +707,12 @@ class WorkerController:
             except Exception as e:
                 logger.exception("Worker loop error: %s", e)
 
-            await asyncio.sleep(POLL_INTERVAL)
+            # Fast re-scan when there are active/in-flight requests so captcha lane (1-at-a-time)
+            # can dispatch the next job immediately after completion.
+            if self._active_ids:
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(POLL_INTERVAL)
 
     async def _run_one(self, req: dict):
         rid = req["id"]
@@ -547,6 +823,21 @@ async def _process_one(
                     skip_kwargs["output_url"] = scene.get(f"{prefix}_upscale_url")
         skip_kwargs["next_retry_at"] = None
         await crud.update_request(rid, **skip_kwargs)
+        skipped_payload = {
+            "id": rid,
+            "status": "COMPLETED",
+            "type": req_type,
+            "project_id": req.get("project_id"),
+            "video_id": req.get("video_id"),
+            "scene_id": req.get("scene_id"),
+            "character_id": req.get("character_id"),
+            "media_id": skip_kwargs.get("media_id"),
+            "output_url": skip_kwargs.get("output_url"),
+            "message": "skipped: already completed",
+            "skipped": True,
+        }
+        await event_bus.emit("request_update", skipped_payload)
+        await event_bus.emit("request_completed", skipped_payload)
         return
 
     # Check prerequisites before dispatching — don't burn retries on missing deps
@@ -557,6 +848,7 @@ async def _process_one(
 
     logger.info("Processing request %s type=%s", rid[:8], req_type)
     await crud.update_request(rid, status="PROCESSING", next_retry_at=None)
+    await _mark_scene_pending(req, status="PROCESSING")
     processing_payload = {
         "id": rid,
         "status": "PROCESSING",
@@ -591,6 +883,7 @@ async def _process_one(
                 error_message=pending_message,
                 next_retry_at=_iso_after(retry_after_sec),
             )
+            await _mark_scene_pending(req, status="PROCESSING")
             pending_payload = {
                 "id": rid,
                 "status": "PENDING",
@@ -604,6 +897,10 @@ async def _process_one(
                 "next_retry_in_sec": retry_after_sec,
             }
             await event_bus.emit("request_update", pending_payload)
+            # If scene stage already got completed through side-channel sync,
+            # immediately reconcile this pending request to avoid "stuck sent" UI.
+            if await _try_reconcile_existing_stage_state(rid, req):
+                return
             return
         if _is_error(result):
             failed_payload = {
@@ -738,6 +1035,7 @@ async def _dispatch(req: dict, orientation: str) -> dict:
                 prompt=edit_prompt, source_media_id=src,
                 project_id=pid, aspect_ratio=aspect,
                 user_paygate_tier=tier,
+                request_type="EDIT_CHARACTER_IMAGE",
             )
         return await ops.generate_reference_image(char, pid)
 
@@ -821,33 +1119,13 @@ async def _handle_failure(
     if retry_after is None:
         retry_after = _retry_state
 
-    error_msg = result.get("error")
-    if not error_msg:
-        data = result.get("data", {})
-        if isinstance(data, dict):
-            ef = data.get("error", "Unknown error")
-            if isinstance(ef, dict):
-                error_msg = ef.get("message", json.dumps(ef)[:200])
-                # Extract detailed reason from error details (e.g. PUBLIC_ERROR_UNSAFE_GENERATION)
-                details = ef.get("details", [])
-                if details and isinstance(details, list):
-                    for d in details:
-                        reason = d.get("reason") if isinstance(d, dict) else None
-                        if reason:
-                            error_msg = f"{error_msg} [{reason}]"
-                            break
-            else:
-                error_msg = str(ef)
-        else:
-            error_msg = "Unknown error"
-    if isinstance(error_msg, dict):
-        error_msg = json.dumps(error_msg)[:200]
-    if not str(error_msg).strip():
-        error_msg = "Unknown error"
+    error_msg = _extract_failure_message(result)
 
     # Reconcile stale state: operation may have completed but app request got a transient
     # poll/read mismatch. If we can confirm SUCCESS from check-status, mark COMPLETED.
     if await _try_reconcile_operation_success(rid, req, error_msg):
+        return
+    if await _try_reconcile_existing_stage_state(rid, req):
         return
 
     # Auto-recover expired media by re-uploading
@@ -856,13 +1134,43 @@ async def _handle_failure(
         if recovered:
             logger.info("Request %s: recovered expired media, retrying", rid[:8])
             await crud.update_request(rid, status="PENDING", error_message=f"recovered: {error_msg}", next_retry_at=None)
+            await _mark_scene_pending(req, status="PENDING")
             return
 
     error_lower = str(error_msg).lower()
 
+    # OAuth token/auth failures: ask extension to refresh token and retry soon,
+    # without burning retry_count.
+    if (
+        "api_401" in error_lower
+        or "http_401" in error_lower
+        or "invalid authentication credentials" in error_lower
+        or "missing required authentication credential" in error_lower
+    ):
+        delay = 18
+        if retry_after is not None:
+            retry_after[rid] = time.time() + delay
+        await crud.update_request(
+            rid,
+            status="PENDING",
+            error_message=str(error_msg),
+            next_retry_at=_iso_after(delay),
+        )
+        await _mark_scene_pending(req, status="PENDING")
+        try:
+            await get_flow_client().refresh_token()
+        except Exception:
+            pass
+        logger.warning(
+            "Request %s got auth failure, deferred %ss without retry increment: %s",
+            rid[:8], delay, error_msg
+        )
+        return
+
     # WS transient errors (extension disconnect/reconnect): retry without incrementing count
     if "extension reconnected" in error_lower or "extension disconnected" in error_lower or "extension not connected" in error_lower:
         await crud.update_request(rid, status="PENDING", error_message=str(error_msg), next_retry_at=None)
+        await _mark_scene_pending(req, status="PENDING")
         logger.info("Request %s transient WS error, will retry (no retry increment): %s", rid[:8], error_msg)
         return
 
@@ -882,6 +1190,7 @@ async def _handle_failure(
             error_message=str(error_msg),
             next_retry_at=_iso_after(delay),
         )
+        await _mark_scene_pending(req, status="PENDING")
         try:
             # Trigger extension warm-up (open/refresh Flow tab + token) opportunistically.
             await get_flow_client().refresh_token()
@@ -893,27 +1202,54 @@ async def _handle_failure(
         )
         return
 
-    # reCAPTCHA errors: exponential backoff + temporary pause for all captcha-consuming requests
-    if "captcha" in error_lower or "recaptcha" in error_lower:
-        retry = req.get("retry_count", 0) + 1
-        if retry < CAPTCHA_RETRY_LIMIT:
-            delay = int(min(CAPTCHA_RETRY_BACKOFF_BASE * (1.6 ** (retry - 1)), CAPTCHA_RETRY_BACKOFF_MAX))
-            is_traffic = _is_unusual_traffic_error(error_lower)
+    # reCAPTCHA / unusual-traffic errors: exponential backoff + temporary pause
+    # for all captcha-consuming requests.
+    if "captcha" in error_lower or "recaptcha" in error_lower or _is_unusual_traffic_error(error_lower):
+        prev_retry = int(req.get("retry_count", 0) or 0)
+        is_traffic = _is_unusual_traffic_error(error_lower)
+        # Do not burn retry budget on GOOGLE_SORRY_PAGE traffic blocks.
+        retry = prev_retry if is_traffic else (prev_retry + 1)
+        backoff_step = max(1, prev_retry + 1)
+        if is_traffic or retry < CAPTCHA_RETRY_LIMIT:
+            delay = int(min(CAPTCHA_RETRY_BACKOFF_BASE * (1.6 ** (backoff_step - 1)), CAPTCHA_RETRY_BACKOFF_MAX))
             is_timeout = _is_captcha_timeout_error(error_lower)
             if is_timeout:
                 delay = max(delay, CAPTCHA_CONTENT_TIMEOUT_PAUSE_SEC)
             if is_traffic:
-                delay = max(delay, CAPTCHA_TRAFFIC_PAUSE_SEC)
+                remaining_match = _TRAFFIC_COOLDOWN_RE.search(error_lower)
+                if remaining_match:
+                    try:
+                        remaining_sec = max(0, int(remaining_match.group(1)))
+                        if remaining_sec > 0:
+                            delay = max(delay, min(CAPTCHA_RETRY_BACKOFF_MAX, remaining_sec + 8))
+                    except Exception:
+                        pass
+                # Progressive cooldown for traffic blocks:
+                # retry#1 ~120s, retry#2 ~210s, retry#3 ~300s ... capped by env.
+                traffic_floor = min(
+                    CAPTCHA_TRAFFIC_PAUSE_SEC,
+                    120 + max(0, retry - 1) * 90,
+                )
+                delay = max(delay, traffic_floor)
+                # Keep DB next_retry_at aligned with worker safe-mode gate.
+                # Otherwise UI shows "ready" while scheduler still blocks internally.
+                safe_mode_floor = min(CAPTCHA_SAFE_MODE_SEC, CAPTCHA_TRAFFIC_PAUSE_SEC)
+                delay = max(delay, safe_mode_floor)
             until = time.time() + delay
             if retry_after is not None:
                 retry_after[rid] = until
             if group_retry_after is not None and req.get("type", "") in _CAPTCHA_CALL_TYPES:
-                group_pause_until = time.time() + max(delay, CAPTCHA_GROUP_PAUSE_SEC)
+                group_pause_sec = max(delay, CAPTCHA_GROUP_PAUSE_SEC)
+                if is_traffic:
+                    # Avoid freezing the whole queue for the full traffic delay.
+                    # Keep a short group pause, then continue in safe mode (low concurrency/high cooldown).
+                    group_pause_sec = min(group_pause_sec, max(CAPTCHA_GROUP_PAUSE_SEC * 2, 180))
+                group_pause_until = time.time() + group_pause_sec
                 group_retry_after["captcha"] = max(group_retry_after.get("captcha", 0.0), group_pause_until)
                 if req.get("type", "") in _IMAGE_CALL_TYPES:
                     group_retry_after["image"] = max(group_retry_after.get("image", 0.0), group_pause_until)
                 if is_traffic:
-                    safe_until = time.time() + max(delay, CAPTCHA_SAFE_MODE_SEC)
+                    safe_until = time.time() + delay
                     group_retry_after["captcha"] = max(group_retry_after.get("captcha", 0.0), safe_until)
                     group_retry_after["captcha_cooldown_until"] = max(
                         group_retry_after.get("captcha_cooldown_until", 0.0),
@@ -924,6 +1260,17 @@ async def _handle_failure(
                             group_retry_after.get("image_safe_mode_until", 0.0),
                             safe_until,
                         )
+                    deferred = await _defer_pending_captcha_requests(
+                        delay,
+                        f"traffic cooldown: {error_msg}",
+                        exclude_id=rid,
+                    )
+                    if deferred:
+                        logger.warning(
+                            "Traffic circuit breaker: deferred %d pending captcha requests for ~%ds",
+                            deferred,
+                            delay,
+                        )
             await crud.update_request(
                 rid,
                 status="PENDING",
@@ -931,6 +1278,7 @@ async def _handle_failure(
                 error_message=str(error_msg),
                 next_retry_at=_iso_after(delay),
             )
+            await _mark_scene_pending(req, status="PENDING")
             if retry <= 2:
                 try:
                     await get_flow_client().refresh_token()
@@ -938,7 +1286,7 @@ async def _handle_failure(
                     pass
             logger.warning(
                 "Request %s reCAPTCHA failed (retry %d/%d), backoff=%ds, traffic=%s timeout=%s",
-                rid[:8], retry, CAPTCHA_RETRY_LIMIT - 1, delay, is_traffic, is_timeout
+                rid[:8], (prev_retry + 1), CAPTCHA_RETRY_LIMIT - 1, delay, is_traffic, is_timeout
             )
             return
         else:
@@ -949,6 +1297,57 @@ async def _handle_failure(
                 rid[:8], CAPTCHA_RETRY_LIMIT - 1, error_msg
             )
             return
+
+    # Quota/model access errors are deterministic for current account/tier.
+    # Fail fast to avoid retry storms that trigger more 403 / captcha.
+    if _is_quota_or_model_access_error(error_lower):
+        await crud.update_request(rid, status="FAILED", error_message=str(error_msg), next_retry_at=None)
+        await _mark_scene_failed(req)
+        logger.warning("Request %s FAILED by quota/access policy: %s", rid[:8], error_msg)
+        return
+
+    # Generic API_403 can be transient session/context mismatch.
+    # Retry a few times with short backoff and token refresh before giving up.
+    if _is_generic_api_403_error(error_lower):
+        retry = req.get("retry_count", 0) + 1
+        max_403_retry = min(MAX_RETRIES, 4)
+        if retry < max_403_retry:
+            delay = min(20 * retry, 90)
+            if retry_after is not None:
+                retry_after[rid] = time.time() + delay
+            if group_retry_after is not None and req.get("type", "") in _CAPTCHA_CALL_TYPES:
+                cool_until = time.time() + max(delay, 45)
+                group_retry_after["captcha_cooldown_until"] = max(
+                    group_retry_after.get("captcha_cooldown_until", 0.0),
+                    cool_until,
+                )
+                if req.get("type", "") in _IMAGE_CALL_TYPES:
+                    group_retry_after["image_cooldown_until"] = max(
+                        group_retry_after.get("image_cooldown_until", 0.0),
+                        cool_until,
+                    )
+            await crud.update_request(
+                rid,
+                status="PENDING",
+                retry_count=retry,
+                error_message=str(error_msg),
+                next_retry_at=_iso_after(delay),
+            )
+            await _mark_scene_pending(req, status="PENDING")
+            try:
+                await get_flow_client().refresh_token()
+            except Exception:
+                pass
+            logger.warning(
+                "Request %s generic API_403 (retry %d/%d), defer=%ss: %s",
+                rid[:8], retry, max_403_retry - 1, delay, error_msg
+            )
+            return
+
+        await crud.update_request(rid, status="FAILED", error_message=str(error_msg), next_retry_at=None)
+        await _mark_scene_failed(req)
+        logger.error("Request %s FAILED after generic API_403 retries: %s", rid[:8], error_msg)
+        return
 
     # Safety-filter blocks are usually deterministic for the same prompt.
     # We already do one auto-safe prompt retry in OperationService; if it still fails,
@@ -985,6 +1384,7 @@ async def _handle_failure(
                 error_message=str(error_msg),
                 next_retry_at=_iso_after(delay),
             )
+            await _mark_scene_pending(req, status="PENDING")
             logger.warning(
                 "Request %s operation-failed transient (retry %d), defer=%ss: %s",
                 rid[:8], retry, delay, error_msg
@@ -1020,6 +1420,7 @@ async def _handle_failure(
             error_message=str(error_msg),
             next_retry_at=_iso_after(delay),
         )
+        await _mark_scene_pending(req, status="PENDING")
         logger.warning("Request %s failed (retry %d/%d): %s", rid[:8], retry, MAX_RETRIES, error_msg)
     else:
         await crud.update_request(rid, status="FAILED", error_message=str(error_msg), next_retry_at=None)
@@ -1074,6 +1475,109 @@ async def _mark_scene_failed(req: dict):
         await crud.update_scene(scene_id, **updates)
 
 
+def _scene_stage_status_field(req_type: str, prefix: str) -> tuple[str | None, str | None]:
+    if req_type in ("GENERATE_IMAGE", "REGENERATE_IMAGE", "EDIT_IMAGE"):
+        return f"{prefix}_image_status", f"{prefix}_image_media_id"
+    if req_type in ("GENERATE_VIDEO", "REGENERATE_VIDEO", "GENERATE_VIDEO_REFS"):
+        return f"{prefix}_video_status", f"{prefix}_video_media_id"
+    if req_type in ("UPSCALE_VIDEO", "UPSCALE_VIDEO_LOCAL"):
+        return f"{prefix}_upscale_status", f"{prefix}_upscale_media_id"
+    return None, None
+
+
+async def _mark_scene_pending(req: dict, status: str = "PENDING"):
+    scene_id = req.get("scene_id")
+    if not scene_id:
+        return
+    orientation = await _resolve_orientation(req)
+    prefix = "vertical" if orientation == "VERTICAL" else "horizontal"
+    status_field, media_field = _scene_stage_status_field(req.get("type", ""), prefix)
+    if not status_field:
+        return
+    scene = await crud.get_scene(scene_id)
+    if not scene:
+        return
+    # Never downgrade an already completed stage with persisted media.
+    if scene.get(status_field) == "COMPLETED" and media_field and scene.get(media_field):
+        return
+    await crud.update_scene(scene_id, **{status_field: status})
+
+
+async def _try_reconcile_existing_stage_state(rid: str, req: dict) -> bool:
+    """Recover request status from already-completed stage state."""
+    req_type = req.get("type", "")
+    orientation = await _resolve_orientation(req)
+    prefix = "vertical" if orientation == "VERTICAL" else "horizontal"
+    media_id = None
+    output_url = None
+
+    if req_type in ("GENERATE_CHARACTER_IMAGE", "REGENERATE_CHARACTER_IMAGE", "EDIT_CHARACTER_IMAGE"):
+        char_id = req.get("character_id")
+        if not char_id:
+            return False
+        char = await crud.get_character(char_id)
+        if not char:
+            return False
+        media_id = char.get("media_id")
+        output_url = char.get("reference_image_url") or char.get("image_url")
+        if not media_id:
+            return False
+    else:
+        scene_id = req.get("scene_id")
+        if not scene_id:
+            return False
+        scene = await crud.get_scene(scene_id)
+        if not scene:
+            return False
+
+        if req_type in ("GENERATE_IMAGE", "REGENERATE_IMAGE", "EDIT_IMAGE"):
+            if scene.get(f"{prefix}_image_status") != "COMPLETED":
+                return False
+            media_id = scene.get(f"{prefix}_image_media_id")
+            output_url = scene.get(f"{prefix}_image_url")
+        elif req_type in ("GENERATE_VIDEO", "REGENERATE_VIDEO", "GENERATE_VIDEO_REFS"):
+            if scene.get(f"{prefix}_video_status") != "COMPLETED":
+                return False
+            media_id = scene.get(f"{prefix}_video_media_id")
+            output_url = scene.get(f"{prefix}_video_url")
+        elif req_type in ("UPSCALE_VIDEO", "UPSCALE_VIDEO_LOCAL"):
+            if scene.get(f"{prefix}_upscale_status") != "COMPLETED":
+                return False
+            media_id = scene.get(f"{prefix}_upscale_media_id")
+            output_url = scene.get(f"{prefix}_upscale_url")
+        else:
+            return False
+
+        if not (media_id or output_url):
+            return False
+
+    await crud.update_request(
+        rid,
+        status="COMPLETED",
+        media_id=media_id,
+        output_url=output_url,
+        error_message="reconciled from existing stage state",
+        next_retry_at=None,
+    )
+
+    payload = {
+        "id": rid,
+        "status": "COMPLETED",
+        "type": req_type,
+        "project_id": req.get("project_id"),
+        "video_id": req.get("video_id"),
+        "scene_id": req.get("scene_id"),
+        "character_id": req.get("character_id"),
+        "media_id": media_id,
+        "output_url": output_url,
+        "message": "reconciled from existing stage state",
+    }
+    await event_bus.emit("request_update", payload)
+    await event_bus.emit("request_completed", payload)
+    logger.info("Reconciled request %s from existing stage state", rid[:8])
+    return True
+
+
 def _extract_operation_name_from_error(error_msg: str | None) -> str | None:
     if not error_msg:
         return None
@@ -1091,6 +1595,8 @@ async def _try_reconcile_operation_success(rid: str, req: dict, error_msg: str |
 
     req_row = await crud.get_request(rid)
     op_name = (req_row or {}).get("request_id") or req.get("request_id") or _extract_operation_name_from_error(error_msg)
+    if isinstance(op_name, str) and op_name.lower().startswith(_SUBMIT_PENDING_PREFIX):
+        op_name = None
     if not op_name:
         return False
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Activity, Bot, PlayCircle, RefreshCw } from "lucide-react";
 import Modal from "../ui/Modal";
 import ActionButton from "../ui/ActionButton";
@@ -40,6 +40,9 @@ interface WorkflowStatus {
     id: string;
     display_order: number;
     narrator_text: string | null;
+    image_media_id?: string | null;
+    video_media_id?: string | null;
+    upscale_media_id?: string | null;
     image_status: string;
     video_status: string;
     upscale_status: string;
@@ -61,6 +64,16 @@ interface SmartContinueResult {
     overall_score: number;
     failed_count: number;
     failed_scene_ids: string[];
+    manual_policy?: string;
+    auto_queue_disabled?: boolean;
+    manual_regen_scenes?: Array<{
+      scene_id: string;
+      display_order: number;
+      overall_score: number;
+      has_critical_errors: boolean;
+      suggested_request_type: "REGENERATE_IMAGE" | "REGENERATE_VIDEO";
+      fix_guide?: string;
+    }>;
   };
   downloaded?: {
     downloaded: number;
@@ -74,6 +87,37 @@ interface VoiceTemplate {
   name: string;
   audio_path: string;
   duration?: number;
+}
+
+interface MonitorState {
+  key: string;
+  running: boolean;
+  project_id: string;
+  video_id?: string | null;
+  orientation?: string | null;
+  interval_sec: number;
+  cycle: number;
+  started_at: string;
+  last_tick_at?: string | null;
+  last_change_at?: string | null;
+  auto_download_upscales: boolean;
+  stop_when_done: boolean;
+  telegram_enabled: boolean;
+  summary_every_cycles: number;
+  milestone_step: number;
+  latest_statusline?: string | null;
+  latest_snapshot?: Record<string, any> | null;
+  latest_error?: string | null;
+  logs: string[];
+}
+
+interface MonitorStateList {
+  monitors: MonitorState[];
+  active_count: number;
+}
+
+interface StatuslinePayload {
+  line: string;
 }
 
 function StageBar({
@@ -123,6 +167,16 @@ export default function PipelineOrchestratorModal({
   const [running, setRunning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [error, setError] = useState("");
+  const [statusline, setStatusline] = useState("");
+  const [monitor, setMonitor] = useState<MonitorState | null>(null);
+  const [monitorIntervalSec, setMonitorIntervalSec] = useState(30);
+  const [monitorSummaryCycles, setMonitorSummaryCycles] = useState(5);
+  const [monitorMilestoneStep, setMonitorMilestoneStep] = useState(10);
+  const [monitorStopWhenDone, setMonitorStopWhenDone] = useState(false);
+  const [monitorAutoDownload, setMonitorAutoDownload] = useState(true);
+  const [telegramToken, setTelegramToken] = useState("");
+  const [telegramChatId, setTelegramChatId] = useState("");
+  const [monitorBusy, setMonitorBusy] = useState(false);
 
   const [includeUpscale, setIncludeUpscale] = useState(true);
   const [includeTTS, setIncludeTTS] = useState(false);
@@ -136,6 +190,8 @@ export default function PipelineOrchestratorModal({
   const [maxReviewRegens, setMaxReviewRegens] = useState("12");
 
   const ori = normalizeOrientation(orientation);
+  const hasMedia = (mediaId?: string | null): boolean =>
+    typeof mediaId === "string" && mediaId.trim().length > 0;
 
   const addLog = (line: string) => {
     setLogs((prev) =>
@@ -144,14 +200,22 @@ export default function PipelineOrchestratorModal({
   };
 
   const load = async () => {
-    const [s, tpls] = await Promise.all([
+    const [s, tpls, mon, line] = await Promise.all([
       fetchAPI<WorkflowStatus>(
         `/api/workflows/status?project_id=${projectId}&video_id=${videoId}`,
       ),
       fetchAPI<VoiceTemplate[]>("/api/tts/templates").catch(() => []),
+      fetchAPI<MonitorStateList>(
+        `/api/workflows/monitor/state?project_id=${projectId}&video_id=${videoId}`,
+      ).catch(() => ({ monitors: [], active_count: 0 })),
+      fetchAPI<StatuslinePayload>(
+        `/api/workflows/statusline?project_id=${projectId}&video_id=${videoId}`,
+      ).catch(() => ({ line: "" })),
     ]);
     setStatus(s);
     setTemplates(tpls);
+    setMonitor(mon.monitors?.[0] ?? null);
+    setStatusline(line.line || "");
     if (!ttsTemplate && tpls[0]) setTtsTemplate(tpls[0].name);
   };
 
@@ -167,6 +231,55 @@ export default function PipelineOrchestratorModal({
     }, ms);
     return () => clearInterval(timer);
   }, [autoPoll, intervalSec, projectId, videoId]);
+
+  const startMonitor = async () => {
+    setMonitorBusy(true);
+    try {
+      const res = await fetchAPI<MonitorState>("/api/workflows/monitor/start", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: projectId,
+          video_id: videoId,
+          orientation: ori,
+          interval_sec: Math.max(5, monitorIntervalSec || 30),
+          summary_every_cycles: Math.max(1, monitorSummaryCycles || 5),
+          milestone_step: Math.max(5, monitorMilestoneStep || 10),
+          auto_download_upscales: monitorAutoDownload,
+          stop_when_done: monitorStopWhenDone,
+          telegram_bot_token: telegramToken.trim() || null,
+          telegram_chat_id: telegramChatId.trim() || null,
+        }),
+      });
+      setMonitor(res);
+      addLog("Monitor nền đã khởi động");
+    } catch (e: any) {
+      const msg = e.message ?? "Không khởi động được monitor";
+      setError(msg);
+      addLog(`Lỗi monitor: ${msg}`);
+    } finally {
+      setMonitorBusy(false);
+      load().catch(() => {});
+    }
+  };
+
+  const stopMonitor = async () => {
+    setMonitorBusy(true);
+    try {
+      const res = await fetchAPI<MonitorState>("/api/workflows/monitor/stop", {
+        method: "POST",
+        body: JSON.stringify({ project_id: projectId, video_id: videoId }),
+      });
+      setMonitor(res);
+      addLog("Monitor nền đã dừng");
+    } catch (e: any) {
+      const msg = e.message ?? "Không dừng được monitor";
+      setError(msg);
+      addLog(`Lỗi monitor: ${msg}`);
+    } finally {
+      setMonitorBusy(false);
+      load().catch(() => {});
+    }
+  };
 
   const queueStage = async (
     stage: "refs" | "images" | "videos" | "upscale",
@@ -189,7 +302,7 @@ export default function PipelineOrchestratorModal({
 
     if (stage === "images") {
       status.scenes
-        .filter((s) => s.image_status !== "COMPLETED")
+        .filter((s) => !hasMedia(s.image_media_id))
         .forEach((s) =>
           requests.push({
             type: "GENERATE_IMAGE",
@@ -204,9 +317,7 @@ export default function PipelineOrchestratorModal({
     if (stage === "videos") {
       status.scenes
         .filter(
-          (s) =>
-            s.video_status !== "COMPLETED" &&
-            s.image_status === "COMPLETED",
+          (s) => !hasMedia(s.video_media_id) && hasMedia(s.image_media_id),
         )
         .forEach((s) =>
           requests.push({
@@ -221,7 +332,11 @@ export default function PipelineOrchestratorModal({
 
     if (stage === "upscale") {
       status.scenes
-        .filter((s) => s.upscale_status !== "COMPLETED")
+        .filter(
+          (s) =>
+            !hasMedia(s.upscale_media_id) &&
+            hasMedia(s.video_media_id),
+        )
         .forEach((s) =>
           requests.push({
             type: "UPSCALE_VIDEO_LOCAL",
@@ -353,6 +468,19 @@ export default function PipelineOrchestratorModal({
         addLog(
           `Review ${res.review.mode}: score=${res.review.overall_score.toFixed(2)} failed=${res.review.failed_count}`,
         );
+        if (
+          res.review.auto_queue_disabled &&
+          (res.review.manual_regen_scenes?.length ?? 0) > 0
+        ) {
+          addLog(
+            "Auto-regen hàng loạt đã khóa. Hãy tạo lại thủ công từng scene theo gợi ý:",
+          );
+          res.review.manual_regen_scenes?.forEach((item) => {
+            addLog(
+              `- Scene #${item.display_order} (${item.scene_id.slice(0, 8)}): ${item.suggested_request_type} · score ${item.overall_score.toFixed(1)}`,
+            );
+          });
+        }
       }
       if (res.downloaded) {
         addLog(
@@ -643,10 +771,7 @@ export default function PipelineOrchestratorModal({
             border: "1px solid var(--border)",
           }}
         >
-          <div
-            className="flex items-center gap-2 text-xs"
-            style={{ color: "var(--muted)" }}
-          >
+          <div className="flex items-center gap-2 text-xs" style={{ color: "var(--muted)" }}>
             <Bot size={12} /> Theo dõi
             <label className="inline-flex items-center gap-1">
               <input
@@ -676,11 +801,100 @@ export default function PipelineOrchestratorModal({
               <RefreshCw size={11} /> Tải lại
             </ActionButton>
           </div>
+          {statusline && (
+            <div
+              className="rounded px-2 py-1 text-xs"
+              style={{
+                border: "1px dashed var(--border)",
+                background: "var(--surface-alt)",
+                color: "var(--text)",
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              }}
+            >
+              {statusline}
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <input
+              className="input"
+              value={monitorIntervalSec}
+              onChange={(e) => setMonitorIntervalSec(Number(e.target.value) || 30)}
+              placeholder="Interval monitor (giây)"
+            />
+            <input
+              className="input"
+              value={monitorSummaryCycles}
+              onChange={(e) => setMonitorSummaryCycles(Number(e.target.value) || 5)}
+              placeholder="Tóm tắt mỗi N vòng"
+            />
+            <input
+              className="input"
+              value={monitorMilestoneStep}
+              onChange={(e) => setMonitorMilestoneStep(Number(e.target.value) || 10)}
+              placeholder="Mốc tiến độ (%)"
+            />
+            <label className="inline-flex items-center gap-2 text-xs" style={{ color: "var(--text)" }}>
+              <input
+                type="checkbox"
+                checked={monitorAutoDownload}
+                onChange={(e) => setMonitorAutoDownload(e.target.checked)}
+              />
+              Tự tải 4K khi có clip mới
+            </label>
+            <label className="inline-flex items-center gap-2 text-xs" style={{ color: "var(--text)" }}>
+              <input
+                type="checkbox"
+                checked={monitorStopWhenDone}
+                onChange={(e) => setMonitorStopWhenDone(e.target.checked)}
+              />
+              Tự dừng khi xong ref/image/video
+            </label>
+            <div />
+            <input
+              className="input"
+              value={telegramToken}
+              onChange={(e) => setTelegramToken(e.target.value)}
+              placeholder="Telegram bot token (tuỳ chọn)"
+            />
+            <input
+              className="input"
+              value={telegramChatId}
+              onChange={(e) => setTelegramChatId(e.target.value)}
+              placeholder="Telegram chat_id (tuỳ chọn)"
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: "var(--muted)" }}>
+            <span>
+              Monitor:{" "}
+              <strong style={{ color: monitor?.running ? "var(--green)" : "var(--text)" }}>
+                {monitor?.running ? "RUNNING" : "STOPPED"}
+              </strong>
+            </span>
+            {monitor?.latest_error && <span style={{ color: "var(--red)" }}>Lỗi: {monitor.latest_error}</span>}
+            <ActionButton
+              variant="ghost"
+              size="sm"
+              onClick={startMonitor}
+              disabled={monitorBusy || !!monitor?.running}
+            >
+              Start monitor
+            </ActionButton>
+            <ActionButton
+              variant="ghost"
+              size="sm"
+              onClick={stopMonitor}
+              disabled={monitorBusy || !monitor?.running}
+            >
+              Stop monitor
+            </ActionButton>
+          </div>
           <div
             className="max-h-[160px] overflow-y-auto text-xs"
             style={{ color: "var(--text)", fontFamily: "monospace" }}
           >
-            {logs.length === 0 ? (
+            {(monitor?.logs?.length ?? 0) > 0 ? (
+              monitor!.logs.map((line, idx) => <div key={`m-${idx}`}>{line}</div>)
+            ) : logs.length === 0 ? (
               <div style={{ color: "var(--muted)" }}>Chưa có log</div>
             ) : (
               logs.map((line, idx) => <div key={idx}>{line}</div>)

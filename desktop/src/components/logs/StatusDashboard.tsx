@@ -49,6 +49,16 @@ interface ProjectStatus {
     suggested_next_action: string
 }
 
+interface StatuslinePayload {
+    line: string
+    project_id?: string | null
+    video_id?: string | null
+    extension_connected?: boolean
+    worker_active?: number
+    worker_slots?: number
+    suggested_next_action?: string | null
+}
+
 function CountPill({ label, value }: { label: string; value: string }) {
     return (
         <span className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs" style={{ background: 'var(--card)', border: '1px solid var(--border)', color: 'var(--text)' }}>
@@ -61,6 +71,7 @@ export default function StatusDashboard() {
     const [projects, setProjects] = useState<ProjectSummary[]>([])
     const [projectId, setProjectId] = useState('')
     const [status, setStatus] = useState<ProjectStatus | null>(null)
+    const [statusline, setStatusline] = useState<StatuslinePayload | null>(null)
     const [autoRefresh, setAutoRefresh] = useState(true)
     const [error, setError] = useState('')
 
@@ -76,18 +87,25 @@ export default function StatusDashboard() {
         setStatus(res)
     }
 
+    const loadStatusline = async () => {
+        const suffix = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
+        const res = await fetchAPI<StatuslinePayload>(`/api/workflows/statusline${suffix}`)
+        setStatusline(res)
+    }
+
     useEffect(() => {
         loadProjects().catch((e: any) => setError(e.message ?? 'Không tải được danh sách dự án'))
     }, [])
 
     useEffect(() => {
         loadStatus().catch((e: any) => setError(e.message ?? 'Không tải được trạng thái'))
+        loadStatusline().catch(() => { })
     }, [projectId])
 
     useEffect(() => {
         if (!autoRefresh) return
         const timer = setInterval(() => {
-            Promise.all([loadProjects(), loadStatus()]).catch(() => { })
+            Promise.all([loadProjects(), loadStatus(), loadStatusline()]).catch(() => { })
         }, 10000)
         return () => clearInterval(timer)
     }, [autoRefresh, projectId])
@@ -104,7 +122,7 @@ export default function StatusDashboard() {
                     ))}
                 </select>
 
-                <ActionButton variant="ghost" size="sm" onClick={() => Promise.all([loadProjects(), loadStatus()]).catch(() => { })}>
+                <ActionButton variant="ghost" size="sm" onClick={() => Promise.all([loadProjects(), loadStatus(), loadStatusline()]).catch(() => { })}>
                     <RefreshCw size={11} /> Tải lại
                 </ActionButton>
 
@@ -127,6 +145,12 @@ export default function StatusDashboard() {
             </div>
 
             {error && <div className="text-xs p-2 rounded" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--red)' }}>{error}</div>}
+
+            {statusline?.line && (
+                <div className="rounded p-2 text-xs" style={{ border: '1px dashed var(--border)', background: 'var(--surface-alt)', color: 'var(--text)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                    {statusline.line}
+                </div>
+            )}
 
             {status && (
                 <div className="flex flex-col gap-2">

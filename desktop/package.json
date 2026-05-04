@@ -11,13 +11,14 @@
     "scripts": {
         "dev": "electron-vite dev",
         "build": "electron-vite build",
+        "verify:packaged-router": "node ./scripts/verify-packaged-router.mjs",
         "prepare:upscale-runtime": "node ./scripts/prepare-upscale-runtime.mjs",
         "prepare:upscale-runtime:all": "node ./scripts/prepare-upscale-runtime.mjs --platform=all",
         "dist": "npm run prepare:upscale-runtime && npm run build && electron-builder --publish never",
         "dist:mac": "npm run prepare:upscale-runtime && npm run build && electron-builder --mac --publish never",
         "dist:win": "node ./scripts/preflight-win-build.mjs && npm run prepare:upscale-runtime -- --platform=win32 && npm run build && electron-builder --win --publish never",
-        "build:win": "npm run dist:win",
-        "build:mac": "npm run dist:mac",
+        "build:win": "npm run verify:packaged-router && npm run dist:win",
+        "build:mac": "npm run verify:packaged-router && npm run dist:mac",
         "preview": "electron-vite preview"
     },
     "dependencies": {

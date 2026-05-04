@@ -10,6 +10,39 @@
 })();
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'GET_FLOW_API') {
+    const requestId = msg.requestId || `flow-api-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const method = String(msg.method || 'GET').toUpperCase();
+    const handler = (e) => {
+      if (e.detail?.requestId !== requestId) return;
+      window.removeEventListener('FLOW_API_RESULT', handler);
+      clearTimeout(timer);
+      reply({
+        status: Number(e.detail?.status) || 0,
+        text: typeof e.detail?.text === 'string' ? e.detail.text : '',
+        error: e.detail?.error || null,
+      });
+    };
+
+    const timer = setTimeout(() => {
+      window.removeEventListener('FLOW_API_RESULT', handler);
+      reply({ error: 'FLOW_API_TIMEOUT' });
+    }, 35000);
+
+    window.addEventListener('FLOW_API_RESULT', handler);
+    window.dispatchEvent(new CustomEvent('FLOW_API_REQUEST', {
+      detail: {
+        requestId,
+        url: msg.url,
+        method,
+        headers: msg.headers || {},
+        body: msg.body ?? null,
+      },
+    }));
+
+    return true;
+  }
+
   if (msg.type !== 'GET_CAPTCHA') return;
 
   const { requestId, pageAction } = msg;

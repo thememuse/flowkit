@@ -44,12 +44,19 @@ const MEDIA_URL_MIN_REMAINING_MS = 90 * 1000;
 const MEDIA_CACHE_STORAGE_KEY = "mediaUrlCacheV1";
 const MEDIA_CACHE_FLUSH_DELAY_MS = 450;
 const TOKEN_CAPTURE_REBROADCAST_MS = 120000;
+const TRAFFIC_COOLDOWN_MS = 15 * 60 * 1000;
+const RECAPTCHA_BLOCK_COOLDOWN_MS = 2 * 60 * 1000;
+const STRICT_CLI_FLOW_MODE = true;
+const FLOW_TAB_STABLE_TIMEOUT_MS = 12000;
+const FLOW_TAB_STABLE_MIN_MS = 1200;
+const FLOW_TAB_HEARTBEAT_MAX_AGE_MS = 30000;
 const mediaUrlCache = new Map();
 const pendingMediaForwardMap = new Map();
 let mediaCacheSaveTimer = null;
 let mediaForwardTimer = null;
 let lastTokenBroadcastValue = "";
 let lastTokenBroadcastAt = 0;
+let trafficBlockUntil = 0;
 
 // ─── URL → Log Type Classifier ─────────────────────────────
 
@@ -206,15 +213,17 @@ function isUsableSignedMediaUrl(url, now = Date.now()) {
 }
 
 function _classifyApiUrl(url) {
-  if (url.includes("uploadImage")) return "UPLOAD";
-  if (url.includes("batchGenerateImages")) return "GEN_IMG";
-  if (url.includes("UpsampleVideo")) return "UPSCALE";
-  if (url.includes("ReferenceImages")) return "GEN_VID_REF";
-  if (url.includes("batchAsyncGenerateVideo")) return "GEN_VID";
-  if (url.includes("batchCheckAsync")) return "POLL";
-  if (url.includes("upsampleImage")) return "UPS_IMG";
-  if (url.includes("/media/")) return "MEDIA";
-  if (url.includes("/credits")) return "CREDITS";
+  const raw = String(url || "");
+  const lower = raw.toLowerCase();
+  if (lower.includes("uploadimage")) return "UPLOAD";
+  if (lower.includes("batchgenerateimages")) return "GEN_IMG";
+  if (lower.includes("upsamplevideo")) return "UPSCALE";
+  if (lower.includes("referenceimages")) return "GEN_VID_REF";
+  if (lower.includes("batchasyncgeneratevideo")) return "GEN_VID";
+  if (lower.includes("batchcheckasync")) return "POLL";
+  if (lower.includes("upsampleimage")) return "UPS_IMG";
+  if (lower.includes("/media/")) return "MEDIA";
+  if (lower.includes("/credits")) return "CREDITS";
   return "API";
 }
 
@@ -442,6 +451,125 @@ function isAuthFailureResponse(status, responseText = "") {
   );
 }
 
+function isUnusualTrafficResponse(status, responseText = "") {
+  if (status !== 403) return false;
+  const text = String(responseText || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("our systems have detected unusual traffic")
+    || text.includes("<title>sorry")
+    || text.includes("/sorry/")
+    || text.includes("too much traffic")
+    || text.includes("public_error_unusual_activity_too_much_traffic")
+  );
+}
+
+function trafficCooldownRemainingMs(now = Date.now()) {
+  const until = Number(trafficBlockUntil || 0);
+  if (!Number.isFinite(until) || until <= now) return 0;
+  return until - now;
+}
+
+function clearTrafficCooldownIfExpired(now = Date.now()) {
+  if (!trafficBlockUntil) return;
+  if (trafficBlockUntil > now) return;
+  trafficBlockUntil = 0;
+  chrome.storage.local.set({ trafficBlockUntil }).catch(() => {});
+}
+
+function activateTrafficCooldown(ms = TRAFFIC_COOLDOWN_MS) {
+  const now = Date.now();
+  const nextUntil = now + Math.max(30_000, Number(ms) || TRAFFIC_COOLDOWN_MS);
+  trafficBlockUntil = Math.max(trafficBlockUntil || 0, nextUntil);
+  chrome.storage.local.set({ trafficBlockUntil }).catch(() => {});
+}
+
+function classifyApiFailure(status, responseText = "") {
+  const code = Number(status) || 500;
+  const text = String(responseText || "").toLowerCase();
+  const hasQuotaReached =
+    text.includes("public_error_user_quota_reached")
+    || text.includes("public_error_per_model_daily_quota_reached")
+    || text.includes("resource has been exhausted")
+    || text.includes("quota reached");
+  const hasModelAccessDenied =
+    text.includes("public_error_model_access_denied")
+    || text.includes("model_access_denied")
+    || text.includes("does not have permission");
+  if (code === 403) {
+    if (isUnusualTrafficResponse(code, text)) {
+      return "API_403: GOOGLE_SORRY_PAGE (unusual traffic)";
+    }
+    if (text.includes("captcha") || text.includes("recaptcha")) {
+      return "API_403: RECAPTCHA_BLOCKED";
+    }
+    if (hasModelAccessDenied) {
+      return "API_403: MODEL_ACCESS_DENIED";
+    }
+    if (hasQuotaReached) {
+      return "API_403: QUOTA_REACHED";
+    }
+    if (
+      text.includes("permission denied")
+      || text.includes("forbidden")
+      || text.includes("insufficient permission")
+    ) {
+      return "API_403: FORBIDDEN";
+    }
+    return "API_403";
+  }
+  if (code === 429) {
+    if (hasQuotaReached) return "API_429: QUOTA_REACHED";
+    return "API_429";
+  }
+  if (code >= 500) return `API_${code}`;
+  return `API_${code}`;
+}
+
+function sanitizeFetchHeaders(headersLike, method = "POST") {
+  const out = {};
+  if (!headersLike || typeof headersLike !== "object") return out;
+  const allowList = new Set([
+    "authorization",
+    "content-type",
+    "accept",
+    "accept-language",
+  ]);
+  const forbiddenExact = new Set([
+    "host",
+    "connection",
+    "content-length",
+    "cookie",
+    "cookie2",
+    "referer",
+    "referrer",
+    "origin",
+    "priority",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "via",
+  ]);
+
+  for (const [rawName, rawValue] of Object.entries(headersLike)) {
+    const name = String(rawName || "").trim().toLowerCase();
+    if (!name) continue;
+    if (!allowList.has(name)) continue;
+    if (name.startsWith("sec-")) continue;
+    if (forbiddenExact.has(name)) continue;
+    if (name === "user-agent") continue;
+    const value = String(rawValue ?? "").trim();
+    if (!value) continue;
+    out[name] = value;
+  }
+
+  if (String(method || "").toUpperCase() !== "GET" && !out["content-type"]) {
+    out["content-type"] = "application/json";
+  }
+  return out;
+}
+
 function addRequestLog(entry) {
   const pid = normalizeProjectId(entry?.projectId || entry?.project_id || "");
   if (pid) {
@@ -513,6 +641,7 @@ async function init() {
     "flowKey",
     "metrics",
     "callbackSecret",
+    "trafficBlockUntil",
   ]);
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
@@ -525,6 +654,13 @@ async function init() {
     metrics.tokenAuthError = null;
   }
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  if (Number.isFinite(Number(data.trafficBlockUntil))) {
+    trafficBlockUntil = Number(data.trafficBlockUntil);
+  }
+  if (trafficCooldownRemainingMs() <= 0 && trafficBlockUntil) {
+    trafficBlockUntil = 0;
+    chrome.storage.local.set({ trafficBlockUntil }).catch(() => {});
+  }
   await loadPersistedMediaCache();
   connectToAgent();
   chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
@@ -647,8 +783,6 @@ const FLOW_TOOLS_PATH_RE = new RegExp(
   `^/fx/(?:${FLOW_LOCALE_SEGMENT}/)?tools/flow(?:/|$)`,
   "i",
 );
-const FLOW_LEGACY_PROJECT_PATH_RE =
-  /^\/fx\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/|$)/i;
 
 function detectFlowLocale() {
   const url = String(lastFlowTabUrl || "");
@@ -681,7 +815,6 @@ function buildFlowEntryUrls(projectId = "") {
   const localeProjectRouteQuery = pid && localeFlowBase
     ? `${localeFlowBase}?projectId=${pid}`
     : "";
-  const legacyProjectRoute = pid ? `https://labs.google/fx/projects/${pid}` : "";
   const localeProjectNewRoute = localeFlowBase
     ? `${localeFlowBase}/project/new`
     : "";
@@ -696,7 +829,6 @@ function buildFlowEntryUrls(projectId = "") {
     FLOW_PROJECT_NEW_URL,
     "https://flow.google.com/",
     pid ? `https://flow.google.com/?projectId=${pid}` : null,
-    legacyProjectRoute || null,
   ].filter(Boolean);
   return Array.from(new Set(urls));
 }
@@ -717,7 +849,6 @@ function isFlowToolUrl(url) {
 
   if (host === "labs.google" || host.endsWith(".labs.google")) {
     if (FLOW_TOOLS_PATH_RE.test(path)) return true;
-    if (FLOW_LEGACY_PROJECT_PATH_RE.test(path)) return true;
   }
 
   return false;
@@ -736,6 +867,17 @@ function isFlowDomainUrl(url) {
   } catch {
     return false;
   }
+}
+
+function isFlowErrorLikeUrl(url) {
+  if (typeof url !== "string" || !url.startsWith("http")) return false;
+  const low = url.toLowerCase();
+  if (low.includes("/sorry/")) return true;
+  if (low.includes("/404")) return true;
+  if (low.includes("error")) return true;
+  // Old path variant often lands on 404 pages.
+  if (low.includes("labs.google/fx/projects/")) return true;
+  return false;
 }
 
 async function getFlowTabsFromWindows() {
@@ -845,6 +987,63 @@ async function waitForFlowTabReady(tabId, timeoutMs = 15000) {
     await sleep(350);
   }
   return null;
+}
+
+async function ensureFlowTabProjectStable(
+  projectId = "",
+  timeoutMs = FLOW_TAB_STABLE_TIMEOUT_MS,
+) {
+  const pid = normalizeProjectId(projectId);
+  const deadline = Date.now() + Math.max(2000, Number(timeoutMs) || FLOW_TAB_STABLE_TIMEOUT_MS);
+  let stableSince = 0;
+  let lastTab = null;
+
+  while (Date.now() < deadline) {
+    const tab = await ensureFlowToolTabReady(pid);
+    if (!tab?.id) {
+      stableSince = 0;
+      await sleep(320);
+      continue;
+    }
+    lastTab = tab;
+
+    const tabReady = !tab.status || String(tab.status).toLowerCase() === "complete";
+    const tabUrl = String(tab.url || "");
+    const projectReady = !pid || flowTabHasProject(tabUrl, pid);
+    const routeReady = isFlowToolUrl(tabUrl) && !isFlowErrorLikeUrl(tabUrl);
+    const heartbeatAgeMs = lastFlowSeenAt ? Date.now() - lastFlowSeenAt : Number.POSITIVE_INFINITY;
+    const heartbeatReady = Number.isFinite(heartbeatAgeMs) && heartbeatAgeMs <= FLOW_TAB_HEARTBEAT_MAX_AGE_MS;
+    const stableNow = tabReady && projectReady && routeReady && heartbeatReady;
+
+    if (stableNow) {
+      if (!stableSince) stableSince = Date.now();
+      if (Date.now() - stableSince >= FLOW_TAB_STABLE_MIN_MS) {
+        return tab;
+      }
+    } else {
+      stableSince = 0;
+      if (
+        pid &&
+        !projectReady &&
+        Number.isInteger(tab.id) &&
+        tab.id >= 0 &&
+        typeof chrome.tabs?.update === "function"
+      ) {
+        try {
+          await chrome.tabs.update(tab.id, {
+            url: buildFlowEntryUrls(pid)[0] || FLOW_ENTRY_URL,
+            active: true,
+          });
+        } catch (_) {
+          // no-op
+        }
+      }
+    }
+
+    await sleep(360);
+  }
+
+  return STRICT_CLI_FLOW_MODE ? null : lastTab;
 }
 
 async function forceNavigateTabToFlow(tabId, projectId = "") {
@@ -976,6 +1175,18 @@ async function ensureFlowToolTabReady(projectId = "") {
     try {
       let tab = await getTabById(lastFlowTabId);
       if (tab?.id) {
+        if (isFlowErrorLikeUrl(tab.url)) {
+          try {
+            if (typeof chrome.tabs?.update === "function") {
+              tab = await chrome.tabs.update(tab.id, {
+                url: normalizedProjectId ? projectTargetUrl : FLOW_ENTRY_URL,
+                active: true,
+              });
+            }
+          } catch (_) {
+            // no-op
+          }
+        }
         if (
           normalizedProjectId &&
           !flowTabHasProject(tab.url, normalizedProjectId) &&
@@ -1100,7 +1311,10 @@ async function captureTokenFromFlowTab(projectId = "") {
   }
   _openingFlowTab = true;
   try {
-    const bestTab = await ensureFlowToolTabReady(projectId);
+    const bestTab = await ensureFlowTabProjectStable(
+      projectId,
+      FLOW_TAB_STABLE_TIMEOUT_MS + 3000,
+    );
     if (!bestTab?.id) {
       console.log("[FlowAgent] Flow tab not ready for token capture");
       return;
@@ -1115,6 +1329,19 @@ async function captureTokenFromFlowTab(projectId = "") {
   } finally {
     _openingFlowTab = false;
   }
+}
+
+async function waitForFreshFlowKey(previousToken = "", timeoutMs = 9000) {
+  const baseline = String(previousToken || "").trim();
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) < timeoutMs) {
+    const token = String(flowKey || "").trim();
+    if (token && /^ya29\./i.test(token) && token !== baseline) {
+      return token;
+    }
+    await sleep(220);
+  }
+  return null;
 }
 
 // ─── WebSocket to Agent ─────────────────────────────────────
@@ -1484,6 +1711,100 @@ async function requestCaptchaFromTab(
   }
 }
 
+async function requestFlowApiFromTab(
+  tabId,
+  payload,
+  projectId = "",
+) {
+  const sendFlowApiMessage = async (tid) =>
+    await chrome.tabs.sendMessage(tid, {
+      type: "GET_FLOW_API",
+      ...(payload || {}),
+    });
+
+  try {
+    return await sendFlowApiMessage(tabId);
+  } catch (error) {
+    const msg = error?.message || "";
+    const shouldInject =
+      msg.includes("Receiving end does not exist") ||
+      msg.includes("Could not establish connection");
+    const hostPermissionDenied =
+      msg.includes("Cannot access contents of the page") ||
+      msg.includes("must request permission to access the respective host");
+
+    if (!shouldInject && !hostPermissionDenied) throw error;
+
+    let tabUrl = "";
+    try {
+      const t = await chrome.tabs.get(tabId);
+      tabUrl = t?.url || "";
+    } catch (_) {
+      // ignore
+    }
+
+    if (!isFlowToolUrl(tabUrl)) {
+      let reopened = await ensureFlowToolTabReady(projectId);
+      if (!reopened?.id) {
+        reopened = await forceNavigateTabToFlow(tabId, projectId);
+      }
+      if (!reopened?.id) {
+        throw new Error(
+          `NO_FLOW_TAB [original_error=${msg}] [tab_url=${tabUrl || "unknown"}]`,
+        );
+      }
+      tabId = reopened.id;
+      tabUrl = reopened.url || "";
+    }
+
+    if (!isFlowToolUrl(tabUrl)) {
+      throw new Error(`FLOW_TAB_NOT_READY [tab_url=${tabUrl || "unknown"}]`);
+    }
+
+    let lastErr = msg;
+    for (let i = 0; i < 2; i += 1) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ["content.js"],
+        });
+      } catch (injectErr) {
+        lastErr = injectErr?.message || lastErr;
+      }
+
+      await sleep(220);
+
+      try {
+        return await sendFlowApiMessage(tabId);
+      } catch (sendErr) {
+        lastErr = sendErr?.message || lastErr;
+        const denied =
+          lastErr.includes("Cannot access contents of the page") ||
+          lastErr.includes(
+            "must request permission to access the respective host",
+          );
+        if (denied) {
+          const reopened =
+            (await ensureFlowToolTabReady(projectId))
+            || (await forceNavigateTabToFlow(tabId, projectId));
+          if (reopened?.id) {
+            tabId = reopened.id;
+            tabUrl = reopened.url || "";
+          } else if (Number.isInteger(tabId) && tabId >= 0) {
+            const forced = await forceNavigateTabToFlow(tabId, projectId);
+            if (forced?.id) {
+              tabId = forced.id;
+              tabUrl = forced.url || "";
+            }
+          }
+        }
+      }
+    }
+
+    throw new Error(`${lastErr} [tab_url=${tabUrl || "unknown"}]`);
+  }
+}
+
 async function solveCaptcha(requestId, captchaAction, projectId = "") {
   let lastError = "NO_FLOW_TAB";
 
@@ -1491,7 +1812,10 @@ async function solveCaptcha(requestId, captchaAction, projectId = "") {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let targetTab = null;
     try {
-      targetTab = await ensureFlowToolTabReady(projectId);
+      targetTab = await ensureFlowTabProjectStable(
+        projectId,
+        FLOW_TAB_STABLE_TIMEOUT_MS + attempt * 1500,
+      );
     } catch (e) {
       lastError = e?.message || "NO_FLOW_TAB";
     }
@@ -2191,45 +2515,64 @@ async function performFlowTabFetch(
   finalBody,
   projectId = "",
 ) {
-  const tab = await ensureFlowToolTabReady(projectId);
-  if (!tab?.id) throw new Error("NO_FLOW_TAB");
+  const safeHeaders = sanitizeFetchHeaders(headers || {}, methodUpper);
+  let lastError = "FLOW_TAB_FETCH_FAILED";
 
-  const execResults = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "MAIN",
-    args: [url, methodUpper, headers || {}, finalBody || null],
-    func: async (targetUrl, method, fetchHeaders, payload) => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const tab = await ensureFlowTabProjectStable(
+      projectId,
+      FLOW_TAB_STABLE_TIMEOUT_MS + attempt * 1800,
+    );
+    if (!tab?.id) {
+      lastError = "NO_FLOW_TAB";
+      await sleep(240);
+      continue;
+    }
+    if (isFlowErrorLikeUrl(tab.url || "")) {
+      lastError = "FLOW_TAB_BAD_ROUTE";
+      await sleep(240);
+      continue;
+    }
+
+    const requestId = `flow-api-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const result = await requestFlowApiFromTab(
+      tab.id,
+      {
+        requestId,
+        url,
+        method: methodUpper,
+        headers: safeHeaders,
+        body: finalBody || null,
+      },
+      projectId,
+    );
+
+    if (Number.isFinite(Number(result?.status)) && Number(result.status) > 0) {
+      return {
+        status: Number(result.status),
+        text: String(result.text || ""),
+      };
+    }
+
+    lastError = result?.error || "FLOW_TAB_FETCH_FAILED";
+    if (String(lastError).toLowerCase().includes("failed to fetch")) {
       try {
-        const response = await fetch(targetUrl, {
-          method,
-          headers: fetchHeaders || {},
-          credentials: "include",
-          body: method === "GET" ? undefined : JSON.stringify(payload || {}),
-        });
-        const text = await response.text();
-        return { ok: true, status: response.status, text };
-      } catch (error) {
-        return {
-          ok: false,
-          error: error?.message || "FLOW_TAB_FETCH_FAILED",
-        };
+        await forceNavigateTabToFlow(tab.id, projectId);
+      } catch (_) {
+        // no-op
       }
-    },
-  });
-
-  const result = execResults?.[0]?.result;
-  if (!result?.ok) {
-    throw new Error(result?.error || "FLOW_TAB_FETCH_FAILED");
+      await sleep(320 + attempt * 200);
+      continue;
+    }
+    break;
   }
-  return {
-    status: Number(result.status) || 500,
-    text: String(result.text || ""),
-  };
+
+  throw new Error(lastError);
 }
 
 async function handleApiRequest(msg) {
   const { id, params } = msg;
-  const { url, method, headers, body, captchaAction } = params;
+  const { url, method, headers, body, captchaAction, requestType } = params;
   const requestProjectId = extractProjectIdFromApiRequest(url, body);
   if (requestProjectId) {
     setActiveProjectId(requestProjectId, "api_request");
@@ -2247,10 +2590,16 @@ async function handleApiRequest(msg) {
 
   setState("running");
   const hasCaptcha = !!captchaAction;
+  const isVideoStatusPoll =
+    /batchcheckasyncvideogenerationstatus/i.test(String(url || ""));
   if (hasCaptcha) metrics.requestCount++;
 
   const logId = id;
-  const logType = _classifyApiUrl(url);
+  const hintedType =
+    typeof requestType === "string" && requestType.trim()
+      ? requestType.trim()
+      : "";
+  const logType = hintedType || _classifyApiUrl(url);
   if (shouldLogType(logType)) {
     const payloadSummary = body ? JSON.stringify(body).slice(0, 200) : null;
     addRequestLog({
@@ -2267,17 +2616,38 @@ async function handleApiRequest(msg) {
   }
 
   try {
-    // Step 1: Solve captcha if needed
+    clearTrafficCooldownIfExpired();
+    if (hasCaptcha) {
+      const coolMs = trafficCooldownRemainingMs();
+      if (coolMs > 0) {
+        const sec = Math.max(3, Math.ceil(coolMs / 1000));
+        const msgText = `traffic cooldown active ${sec}s`;
+        sendToAgent({
+          id,
+          status: 202,
+          pending: true,
+          retry_after_sec: sec,
+          message: msgText,
+          data: { cooldown: true },
+        });
+        updateRequestLog(logId, {
+          status: "processing",
+          error: `COOLDOWN_WAIT: ${msgText}`,
+          httpStatus: 202,
+        });
+        setState("idle");
+        return;
+      }
+    }
+
+    // Step 1: Solve captcha if needed (single pass, like upstream CLI flow)
     let captchaToken = null;
     if (captchaAction) {
       const captchaResult = await solveCaptcha(id, captchaAction, requestProjectId);
       captchaToken = captchaResult?.token || null;
       if (!captchaToken) {
-        // Cannot proceed without captcha — API will 403
         const err = captchaResult?.error || "CAPTCHA_FAILED";
-        console.error(
-          `[FlowAgent] Captcha failed for ${captchaAction}: ${err}`,
-        );
+        console.error(`[FlowAgent] Captcha failed for ${captchaAction}: ${err}`);
         sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
         if (hasCaptcha) {
           metrics.failedCount++;
@@ -2293,187 +2663,172 @@ async function handleApiRequest(msg) {
       }
     }
 
-    // Step 2: Inject captcha token into body
-    let finalBody = body;
-    if (captchaToken && finalBody) {
-      finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
-      if (finalBody.clientContext?.recaptchaContext) {
-        finalBody.clientContext.recaptchaContext.token = captchaToken;
+    // Step 2: Inject captcha token into request body once.
+    const withCaptchaToken = (baseBody, token) => {
+      if (!baseBody) return baseBody;
+      const next = JSON.parse(JSON.stringify(baseBody));
+      if (!token) return next;
+      if (next.clientContext?.recaptchaContext) {
+        next.clientContext.recaptchaContext.token = token;
       }
-      if (finalBody.requests && Array.isArray(finalBody.requests)) {
-        for (const req of finalBody.requests) {
+      if (next.requests && Array.isArray(next.requests)) {
+        for (const req of next.requests) {
           if (req.clientContext?.recaptchaContext) {
-            req.clientContext.recaptchaContext.token = captchaToken;
+            req.clientContext.recaptchaContext.token = token;
           }
         }
       }
-    }
+      return next;
+    };
+    let finalBody = withCaptchaToken(body, captchaToken);
 
-    // Step 3: Use flowKey for auth (with one bootstrap attempt if missing)
+    // Step 3: Ensure auth token exists (single bootstrap attempt).
     let activeFlowKey = flowKey;
     if (!activeFlowKey) {
       try {
         await captureTokenFromFlowTab(requestProjectId);
       } catch (_) {
-        // ignore bootstrap errors and continue
+        // keep fallback behavior below
       }
-      await sleep(700);
+      await sleep(600);
       activeFlowKey = flowKey;
     }
+    if (!activeFlowKey) {
+      sendToAgent({ id, status: 503, error: "NO_FLOW_KEY" });
+      if (hasCaptcha) {
+        metrics.failedCount++;
+        metrics.lastError = "NO_FLOW_KEY";
+      }
+      updateRequestLog(logId, { status: "failed", error: "NO_FLOW_KEY" });
+      chrome.storage.local.set({ metrics });
+      setState("idle");
+      return;
+    }
 
+    // Step 4: Send API request (with one-shot auth refresh retry on 401).
+    // Prefer Flow-tab context for generation calls to stay closest to real user browsing context.
     const methodUpper = String(method || "POST").toUpperCase();
-    const isReadGet = methodUpper === "GET";
-    const isMediaRead = /\/v1\/media\//.test(url);
-    const isCreditsRead = /\/v1\/credits(?:\?|$)/.test(url);
+    // Polling video operation status via background fetch often triggers 403/traffic
+    // despite the same operation being visible in Flow tab. Force tab-context for
+    // status polling to keep behavior aligned with in-tab user session.
+    const preferFlowTabContext =
+      (hasCaptcha && methodUpper !== "GET") || isVideoStatusPoll;
 
-    const buildFetchUrl = ({
-      dropProjectContext = false,
-    } = {}) => {
-      if (!dropProjectContext) return url;
-      try {
-        const parsed = new URL(url);
-        parsed.searchParams.delete("clientContext.projectId");
-        return parsed.toString();
-      } catch {
-        return url;
-      }
-    };
+    const executeApiCall = async (bearerToken) => {
+      const fetchHeaders = { ...(headers || {}) };
+      fetchHeaders.authorization = `Bearer ${bearerToken}`;
+      const safeFetchHeaders = sanitizeFetchHeaders(fetchHeaders, methodUpper);
 
-    const buildFetchHeaders = (
-      token,
-      { minimal = false } = {},
-    ) => {
-      const base = { ...(headers || {}) };
-      const mustMinimize = minimal || (isReadGet && (isMediaRead || isCreditsRead));
-      if (mustMinimize) {
-        const clean = {};
-        const accept = base.accept || base.Accept;
-        const lang = base["accept-language"] || base["Accept-Language"];
-        if (accept) clean.accept = accept;
-        if (lang) clean["accept-language"] = lang;
-        if (token) clean.authorization = `Bearer ${token}`;
-        return clean;
-      }
-      if (token) {
-        base.authorization = `Bearer ${token}`;
-      } else {
-        delete base.authorization;
-      }
-      return base;
-    };
-
-    const performApiFetch = async (
-      token,
-      { minimal = false, dropProjectContext = false, omitCredentials = false } = {},
-    ) => {
-      const targetUrl = buildFetchUrl({ dropProjectContext });
-      const fetchHeaders = buildFetchHeaders(token, { minimal });
-      return fetch(targetUrl, {
-        method: methodUpper,
-        headers: fetchHeaders,
-        credentials: omitCredentials ? "omit" : "include",
-        body: methodUpper === "GET" ? undefined : JSON.stringify(finalBody),
-      });
-    };
-
-    // Step 4: Make the API call from browser context
-    let response = null;
-    let responseText = "";
-    const applyTabResponse = (tabResult) => {
-      response = {
-        status: Number(tabResult?.status) || 500,
-        ok: Number(tabResult?.status) >= 200 && Number(tabResult?.status) < 300,
+      let responseStatus = 500;
+      let responseText = "";
+      let usedFlowTabFallback = false;
+      const doBackgroundFetch = async () => {
+        const response = await fetch(url, {
+          method: methodUpper,
+          headers: safeFetchHeaders,
+          credentials: "omit",
+          body: methodUpper === "GET" ? undefined : JSON.stringify(finalBody),
+        });
+        return {
+          status: Number(response.status) || 500,
+          text: await response.text(),
+        };
       };
-      responseText = String(tabResult?.text || "");
-    };
 
-    try {
-      response = await performApiFetch(activeFlowKey);
-      responseText = await response.text();
-    } catch (primaryFetchErr) {
-      if (!(isMediaRead || isCreditsRead)) throw primaryFetchErr;
-
-      // Fallback path for /v1/media where strict endpoint header handling can fail.
       try {
-        response = await performApiFetch(activeFlowKey, { minimal: true });
-        responseText = await response.text();
-      } catch (retryErr) {
-        try {
-          response = await performApiFetch(activeFlowKey, {
-            minimal: true,
-            dropProjectContext: true,
-            omitCredentials: true,
-          });
-          responseText = await response.text();
-        } catch (_) {
+        if (preferFlowTabContext) {
           const viaTab = await performFlowTabFetch(
-            buildFetchUrl({ dropProjectContext: true }),
+            url,
             methodUpper,
-            buildFetchHeaders(activeFlowKey, { minimal: true }),
+            safeFetchHeaders,
             finalBody,
             requestProjectId,
           );
-          applyTabResponse(viaTab);
+          responseStatus = Number(viaTab?.status) || 500;
+          responseText = String(viaTab?.text || "");
+        } else {
+          const fallback = await doBackgroundFetch();
+          responseStatus = fallback.status;
+          responseText = fallback.text;
         }
+      } catch (flowTabErr) {
+        const flowTabErrMsg = String(flowTabErr?.message || "FLOW_TAB_FETCH_FAILED");
+        let canRescueByBackgroundFetch =
+          flowTabErrMsg.includes("Failed to fetch") ||
+          flowTabErrMsg.includes("FLOW_API_TIMEOUT") ||
+          flowTabErrMsg.includes("Could not establish connection") ||
+          flowTabErrMsg.includes("Receiving end does not exist");
+        // For status polling we prefer waiting for a healthy Flow tab context
+        // over immediate background fallback (which is commonly blocked/403).
+        if (isVideoStatusPoll) {
+          canRescueByBackgroundFetch = false;
+        }
+        if (preferFlowTabContext && STRICT_CLI_FLOW_MODE && !canRescueByBackgroundFetch) {
+          throw new Error(`FLOW_TAB_CONTEXT_REQUIRED: ${flowTabErrMsg}`);
+        }
+        const fallback = await doBackgroundFetch();
+        responseStatus = fallback.status;
+        responseText = fallback.text;
+        usedFlowTabFallback = true;
       }
-    }
 
-    // Token/context may be stale (401 and sometimes 400 on credits endpoint).
-    // Try one token-refresh + one retry.
-    const shouldRetryAuth =
-      response
-      && (
-        response.status === 401
-        || (isCreditsRead && response.status === 400)
-      );
-    if (shouldRetryAuth) {
+      return { responseStatus, responseText, usedFlowTabFallback };
+    };
+
+    let { responseStatus, responseText, usedFlowTabFallback } = await executeApiCall(activeFlowKey);
+    let authRefreshRetried = false;
+    if (isAuthFailureResponse(responseStatus, responseText)) {
+      setTokenAuthState("invalid", `HTTP_${responseStatus}`);
+      const previousToken = String(activeFlowKey || "").trim();
+      if (flowKey && String(flowKey).trim() === previousToken) {
+        flowKey = null;
+        chrome.storage.local.set({ flowKey: null }).catch(() => {});
+      }
       try {
         await captureTokenFromFlowTab(requestProjectId);
       } catch (_) {
-        // ignore refresh errors and keep original response
+        // no-op
       }
-      await sleep(900);
-      const refreshedFlowKey = flowKey;
-      if (refreshedFlowKey && refreshedFlowKey !== activeFlowKey) {
-        activeFlowKey = refreshedFlowKey;
+      const refreshedToken = await waitForFreshFlowKey(previousToken, 9000);
+      if (refreshedToken) {
+        activeFlowKey = refreshedToken;
+        const retryResult = await executeApiCall(activeFlowKey);
+        responseStatus = retryResult.responseStatus;
+        responseText = retryResult.responseText;
+        usedFlowTabFallback = retryResult.usedFlowTabFallback;
+        authRefreshRetried = true;
+      }
+    }
+
+    let captchaRefreshRetried = false;
+    if (hasCaptcha) {
+      let preFailure = classifyApiFailure(responseStatus, responseText);
+      if (preFailure === "API_403: RECAPTCHA_BLOCKED") {
+        const action =
+          String(captchaAction || "VIDEO_GENERATION").trim() || "VIDEO_GENERATION";
+        await sleep(600);
+        let cap = null;
         try {
-          response = await performApiFetch(activeFlowKey, {
-            minimal: isReadGet && (isMediaRead || isCreditsRead),
-            dropProjectContext: false,
-          });
-          responseText = await response.text();
-        } catch (retry401Err) {
-          if (!(isReadGet && (isMediaRead || isCreditsRead))) throw retry401Err;
-          const viaTab = await performFlowTabFetch(
-            buildFetchUrl({ dropProjectContext: false }),
-            methodUpper,
-            buildFetchHeaders(activeFlowKey, { minimal: true }),
-            finalBody,
-            requestProjectId,
-          );
-          applyTabResponse(viaTab);
+          cap = await solveCaptcha(`${id}-retry-captcha`, action, requestProjectId);
+        } catch (_) {
+          cap = null;
+        }
+        const nextToken = String(cap?.token || "").trim();
+        if (nextToken) {
+          finalBody = withCaptchaToken(body, nextToken);
+          const retryResult = await executeApiCall(activeFlowKey);
+          responseStatus = retryResult.responseStatus;
+          responseText = retryResult.responseText;
+          usedFlowTabFallback = retryResult.usedFlowTabFallback;
+          captchaRefreshRetried = true;
         }
       }
     }
 
-    // Google can intermittently return 500 for project-scoped /v1/media calls.
-    // Retry once globally with minimal headers before surfacing the failure.
-    if (response && isMediaRead && response.status >= 500) {
-      try {
-        const retryResp = await performApiFetch(activeFlowKey, {
-          minimal: true,
-          dropProjectContext: true,
-          omitCredentials: true,
-        });
-        const retryText = await retryResp.text();
-        if (retryResp.ok || retryResp.status < response.status) {
-          response = retryResp;
-          responseText = retryText;
-        }
-      } catch (_) {
-        // Keep original failed response
-      }
-    }
+    const response = {
+      status: responseStatus,
+      ok: responseStatus >= 200 && responseStatus < 300,
+    };
 
     let responseData;
     try {
@@ -2482,11 +2837,51 @@ async function handleApiRequest(msg) {
       responseData = responseText;
     }
 
-    sendToAgent({
-      id,
-      status: response.status,
-      data: responseData,
-    });
+    const failureCode = response?.ok
+      ? null
+      : classifyApiFailure(response?.status, responseText);
+    const recaptchaBlocked = String(failureCode || "").includes("RECAPTCHA_BLOCKED");
+    const trafficBlocked =
+      !response?.ok
+      && (
+        isUnusualTrafficResponse(response?.status, responseText)
+        || String(failureCode || "").includes("GOOGLE_SORRY_PAGE")
+        || recaptchaBlocked
+      );
+    if (trafficBlocked) {
+      activateTrafficCooldown(
+        recaptchaBlocked ? RECAPTCHA_BLOCK_COOLDOWN_MS : TRAFFIC_COOLDOWN_MS,
+      );
+    }
+
+    if (trafficBlocked) {
+      const coolMs = trafficCooldownRemainingMs();
+      const sec = Math.max(6, Math.ceil(coolMs / 1000));
+      const pendingMsg = failureCode || `API_${response?.status || 500}`;
+      sendToAgent({
+        id,
+        status: 202,
+        pending: true,
+        retry_after_sec: sec,
+        message: pendingMsg,
+        data: responseData,
+      });
+    } else {
+      sendToAgent(
+        response?.ok
+          ? {
+              id,
+              status: response.status,
+              data: responseData,
+            }
+          : {
+              id,
+              status: response.status,
+              data: responseData,
+              error: failureCode || `API_${response?.status || 500}`,
+            },
+      );
+    }
 
     const responseSummary = responseText ? responseText.slice(0, 300) : null;
     if (isAuthFailureResponse(response.status, responseText)) {
@@ -2502,18 +2897,36 @@ async function handleApiRequest(msg) {
       updateRequestLog(logId, {
         status: "success",
         httpStatus: response.status,
+        responseSummary: usedFlowTabFallback
+          ? `[fallback:bg_fetch] ${responseSummary || ""}`.slice(0, 300)
+          : (
+            authRefreshRetried
+              ? `[auth-refresh-retry] ${responseSummary || ""}`.slice(0, 300)
+              : responseSummary
+          ),
+      });
+    } else if (trafficBlocked) {
+      updateRequestLog(logId, {
+        status: "processing",
+        error: `${failureCode || `API_${response.status}`} (cooldown)`,
+        httpStatus: 202,
         responseSummary,
       });
     } else {
       if (hasCaptcha) {
         metrics.failedCount++;
-        metrics.lastError = `API_${response.status}`;
+        metrics.lastError = failureCode || `API_${response.status}`;
       }
+      const payloadFlags = [];
+      if (authRefreshRetried) payloadFlags.push("auth_refresh_retried=1");
+      if (usedFlowTabFallback) payloadFlags.push("flow_tab_fallback=background_fetch");
+      if (captchaRefreshRetried) payloadFlags.push("captcha_refresh_retried=1");
       updateRequestLog(logId, {
         status: "failed",
-        error: `API_${response.status}`,
+        error: failureCode || `API_${response.status}`,
         httpStatus: response.status,
         responseSummary,
+        ...(payloadFlags.length ? { payloadSummary: payloadFlags.join(" ") } : {}),
       });
     }
   } catch (e) {
@@ -2582,6 +2995,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   }
 
   if (msg.type === "STATUS") {
+    clearTrafficCooldownIfExpired();
+    const trafficCooldownMs = trafficCooldownRemainingMs();
     reply({
       connected: ws?.readyState === WebSocket.OPEN,
       agentConnected: ws?.readyState === WebSocket.OPEN,
@@ -2606,7 +3021,10 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
         tokenAuthState: metrics.tokenAuthState || "unknown",
         tokenAuthCheckedAt: metrics.tokenAuthCheckedAt || null,
         tokenAuthError: metrics.tokenAuthError || null,
+        trafficCooldownMs,
       },
+      trafficCooldownMs,
+      trafficCooldownUntil: trafficBlockUntil || null,
       state,
     });
   }

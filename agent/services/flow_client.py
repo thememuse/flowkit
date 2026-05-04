@@ -1826,7 +1826,8 @@ class FlowClient:
                                aspect_ratio: str = "IMAGE_ASPECT_RATIO_PORTRAIT",
                                user_paygate_tier: str = "PAYGATE_TIER_TWO",
                                character_media_ids: list[str] = None,
-                               image_model_key: str | None = None) -> dict:
+                               image_model_key: str | None = None,
+                               request_type: str | None = None) -> dict:
         """Generate image(s).
 
         If character_media_ids is provided, uses edit_image flow (batchGenerateImages
@@ -1872,6 +1873,7 @@ class FlowClient:
             "headers": random_headers(),
             "body": body,
             "captchaAction": "IMAGE_GENERATION",
+            "requestType": request_type,
         })
 
     async def edit_image(self, prompt: str, source_media_id: str,
@@ -1879,7 +1881,8 @@ class FlowClient:
                           aspect_ratio: str = "IMAGE_ASPECT_RATIO_PORTRAIT",
                           user_paygate_tier: str = "PAYGATE_TIER_ONE",
                           character_media_ids: list[str] = None,
-                          image_model_key: str | None = None) -> dict:
+                          image_model_key: str | None = None,
+                          request_type: str | None = None) -> dict:
         """Edit an existing image using IMAGE_INPUT_TYPE_BASE_IMAGE.
 
         If character_media_ids is provided, appends them as IMAGE_INPUT_TYPE_REFERENCE
@@ -1921,6 +1924,7 @@ class FlowClient:
             "headers": random_headers(),
             "body": body,
             "captchaAction": "IMAGE_GENERATION",
+            "requestType": request_type,
         })
 
     async def generate_video(self, start_image_media_id: str, prompt: str,
@@ -1928,7 +1932,8 @@ class FlowClient:
                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                               end_image_media_id: str = None,
                               user_paygate_tier: str = "PAYGATE_TIER_TWO",
-                              video_model_key: str | None = None) -> dict:
+                              video_model_key: str | None = None,
+                              request_key: str | None = None) -> dict:
         """Generate video from start image (i2v).
 
         Two sub-types:
@@ -1974,8 +1979,9 @@ class FlowClient:
             if end_image_media_id:
                 request["endImage"] = {"mediaId": end_image_media_id}
 
+            batch_id = str(request_key or uuid.uuid4())
             body = {
-                "mediaGenerationContext": {"batchId": f"{uuid.uuid4()}"},
+                "mediaGenerationContext": {"batchId": batch_id},
                 "clientContext": self._client_context(project_id, ctx_tier),
                 "requests": [request],
                 "useV2ModelConfig": True,
@@ -1987,6 +1993,7 @@ class FlowClient:
                 "headers": random_headers(),
                 "body": body,
                 "captchaAction": "VIDEO_GENERATION",
+                "requestType": "GENERATE_VIDEO",
             }, timeout=60)
 
             last_result = result
@@ -2008,7 +2015,8 @@ class FlowClient:
                                               prompt: str, project_id: str, scene_id: str,
                                               aspect_ratio: str = "VIDEO_ASPECT_RATIO_PORTRAIT",
                                               user_paygate_tier: str = "PAYGATE_TIER_TWO",
-                                              video_model_key: str | None = None) -> dict:
+                                              video_model_key: str | None = None,
+                                              request_key: str | None = None) -> dict:
         """Generate video from multiple reference images (r2v).
 
         Uses referenceImages instead of startImage — the model composes
@@ -2052,11 +2060,12 @@ class FlowClient:
                     {"mediaId": mid, "imageUsageType": "IMAGE_USAGE_TYPE_ASSET"}
                     for mid in reference_media_ids
                 ],
-                "metadata": {},
+                "metadata": {"sceneId": scene_id},
             }
 
+            batch_id = str(request_key or uuid.uuid4())
             body = {
-                "mediaGenerationContext": {"batchId": f"{uuid.uuid4()}"},
+                "mediaGenerationContext": {"batchId": batch_id},
                 "clientContext": self._client_context(project_id, ctx_tier),
                 "requests": [request],
                 "useV2ModelConfig": True,
@@ -2068,6 +2077,7 @@ class FlowClient:
                 "headers": random_headers(),
                 "body": body,
                 "captchaAction": "VIDEO_GENERATION",
+                "requestType": "GENERATE_VIDEO_REFS",
             }, timeout=60)
 
             last_result = result
@@ -2367,7 +2377,8 @@ class FlowClient:
         return last_result
 
     async def upload_image(self, image_base64: str, mime_type: str = "image/jpeg",
-                            project_id: str = "", file_name: str = "image.jpg") -> dict:
+                            project_id: str = "", file_name: str = "image.jpg",
+                            request_type: str | None = None) -> dict:
         """Upload an image for use as start/end frame.
 
         Uses /v1/flow/uploadImage endpoint.
@@ -2392,6 +2403,7 @@ class FlowClient:
             "method": "POST",
             "headers": random_headers(),
             "body": body,
+            "requestType": request_type,
         }, timeout=60)
 
         # Extract media.name for convenience (used as mediaId in video gen)

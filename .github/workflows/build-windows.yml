@@ -75,6 +75,10 @@ jobs:
         working-directory: desktop
         run: npm install --legacy-peer-deps
 
+      - name: Verify packaged routing guard
+        working-directory: desktop
+        run: npm run verify:packaged-router
+
       - name: Build Electron app (Windows)
         working-directory: desktop
         run: npm run build:win

@@ -3,8 +3,8 @@ import { Sparkles, Search, ChevronDown, ChevronUp, Plus, Trash2, AlertCircle } f
 import Modal from '../ui/Modal'
 import ActionButton from '../ui/ActionButton'
 import {
-    researchTopic, analyzeStory, aiGenerate, loadKeys, loadGeneralSettings,
-    type ExtractedProject, type ProviderType
+    researchTopic, analyzeStory, aiGenerateWithRetry, loadKeys, loadGeneralSettings,
+    SCRIPT_WRITING_STYLE_OPTIONS, type ExtractedProject, type ProviderType, type ScriptWritingStyle
 } from '../../api/ai-service'
 import { fetchAPI } from '../../api/client'
 
@@ -37,6 +37,29 @@ function projectNameFromTopic(topic: string): string {
 }
 
 type YouTubeMode = 'content' | 'style'
+
+function scriptStylePromptHint(style: ScriptWritingStyle, language: string): string {
+    const lang = language === 'vi' ? 'Vietnamese' : language === 'en' ? 'English' : language === 'es' ? 'Spanish' : language
+    if (style === 'copywriting') {
+        return `Style mode: Copywriting Hook.
+- Hook mạnh ở cảnh đầu, lợi ích rõ và cụ thể.
+- Mỗi cảnh một ý chính; cuối cảnh có nhịp dẫn sang cảnh tiếp theo.
+- Không phóng đại/số liệu bịa. Narration output in ${lang}.`
+    }
+    if (style === 'manga_drama') {
+        return `Style mode: Manga Drama.
+- Bố cục như panel manga: setup -> motion beat -> emotion beat -> transition.
+- Nhịp cảm xúc rõ và hành động giàu động tác camera.
+- Giữ continuity nhân vật/bối cảnh xuyên suốt. Narration output in ${lang}.`
+    }
+    if (style === 'dramatic') {
+        return `Style mode: Dramatic Cinematic.
+- Tăng tương phản, sân khấu hoá bố cục, căng thẳng tăng dần.
+- Camera/shot intent phải thay đổi rõ giữa các cảnh liền nhau.
+- Narration ngắn, chắc, giàu cảm xúc. Narration output in ${lang}.`
+    }
+    return `Style mode: Standard cinematic balance. Narration output in ${lang}.`
+}
 
 interface YouTubeReferencePayload {
     url: string
@@ -86,6 +109,8 @@ function ResearchStep({
     setOrientation,
     sceneCount,
     setSceneCount,
+    scriptStyle,
+    setScriptStyle,
     initialTopic,
     onTopicChange,
     onSkip,
@@ -97,6 +122,8 @@ function ResearchStep({
     materials: string[]
     orientation: string; setOrientation: (o: string) => void
     sceneCount: number; setSceneCount: (n: number) => void
+    scriptStyle: ScriptWritingStyle
+    setScriptStyle: (s: ScriptWritingStyle) => void
     initialTopic: string
     onTopicChange: (topic: string) => void
     onSkip: () => void; onNext: (summary: string) => void
@@ -171,6 +198,8 @@ function ResearchStep({
                 setLanguage={setLanguage}
                 sceneCount={sceneCount}
                 setSceneCount={setSceneCount}
+                scriptStyle={scriptStyle}
+                setScriptStyle={setScriptStyle}
             />
 
             {!hasKeys && (
@@ -241,6 +270,7 @@ function StoryStep({
     story, setStory, material, setMaterial,
     materials,
     language, setLanguage, orientation, setOrientation, sceneCount, setSceneCount,
+    scriptStyle, setScriptStyle,
     provider, setProvider, onAnalyze, error, onBack
 }: any) {
     const stats = keyStats(provider)
@@ -347,6 +377,8 @@ function StoryStep({
                 setLanguage={setLanguage}
                 sceneCount={sceneCount}
                 setSceneCount={setSceneCount}
+                scriptStyle={scriptStyle}
+                setScriptStyle={setScriptStyle}
             />
             {error && <div className="text-xs rounded p-2" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--red)', border: '1px solid rgba(239,68,68,0.3)' }}>{error}</div>}
             <div className="flex justify-end gap-2 pt-2">
@@ -528,6 +560,7 @@ export default function AISetupModal({ onClose, onCreated }: Props) {
     const [language, setLanguage] = useState(defaults.defaultLanguage)
     const [orientation, setOrientation] = useState('VERTICAL')
     const [sceneCount, setSceneCount] = useState(8)
+    const [scriptStyle, setScriptStyle] = useState<ScriptWritingStyle>('standard')
     const [error, setError] = useState('')
     const [statusMsg, setStatusMsg] = useState('')
     const [extracted, setExtracted] = useState<ExtractedProject | null>(null)
@@ -568,7 +601,7 @@ export default function AISetupModal({ onClose, onCreated }: Props) {
             const analysisInput = episodeCtx
                 ? `PROJECT CONTEXT (global, must stay consistent across all videos):\n${projectCtx}\n\nEPISODE FOCUS (this video only):\n${episodeCtx}`
                 : projectCtx
-            const result = await analyzeStory(analysisInput, language, sceneCount, provider)
+            const result = await analyzeStory(analysisInput, language, sceneCount, provider, scriptStyle)
             if (!result.characters || !result.scenes) throw new Error('Invalid AI response')
             setExtracted(result)
             setStep('review')
@@ -599,6 +632,7 @@ export default function AISetupModal({ onClose, onCreated }: Props) {
                     : language === 'es'
                         ? 'Spanish'
                         : language
+            const styleHint = scriptStylePromptHint(scriptStyle, language)
             const systemPrompt = `You are a senior documentary script analyst.
 Always return valid JSON only, no markdown.`
             const commonContext = `Language output: ${lang}
@@ -608,6 +642,8 @@ Source duration: ${yt.duration_sec ?? 'unknown'} seconds
 Source upload_date: ${yt.upload_date ?? 'unknown'}
 Transcript language: ${yt.transcript_language}
 Caption type: ${yt.caption_type}
+
+${styleHint}
 
 CURRENT PROJECT CONTEXT (user draft):
 ${projectStory || '(empty)'}
@@ -648,11 +684,11 @@ Return JSON:
   "style_blueprint": ["Hook pattern", "Act structure", "Scene pacing", "Narration tone"]
 }`
 
-            const parsed = await aiGenerate<{
+            const parsed = await aiGenerateWithRetry<{
                 project_context?: string
                 episode_story?: string
                 suggested_video_title?: string
-            }>(prompt, systemPrompt, provider)
+            }>(prompt, systemPrompt, provider, { timeoutMs: 420000, retries: 3 })
 
             const nextProject = (parsed.project_context || '').trim()
             const nextEpisode = (parsed.episode_story || '').trim()
@@ -814,6 +850,8 @@ Return JSON:
                     material={material} setMaterial={setMaterial} materials={materials}
                     orientation={orientation} setOrientation={setOrientation}
                     sceneCount={sceneCount} setSceneCount={setSceneCount}
+                    scriptStyle={scriptStyle}
+                    setScriptStyle={setScriptStyle}
                     initialTopic={researchKeyword}
                     onTopicChange={applyResearchKeyword}
                     onSkip={() => setStep('story')}
@@ -846,6 +884,7 @@ Return JSON:
                     material={material} setMaterial={setMaterial} materials={materials} language={language} setLanguage={setLanguage}
                     orientation={orientation} setOrientation={setOrientation}
                     sceneCount={sceneCount} setSceneCount={setSceneCount}
+                    scriptStyle={scriptStyle} setScriptStyle={setScriptStyle}
                     provider={provider} setProvider={setProvider}
                     onAnalyze={analyze} error={error} onBack={() => setStep('research')} />
             )}
@@ -889,6 +928,8 @@ function SettingsGrid({
     setLanguage,
     sceneCount,
     setSceneCount,
+    scriptStyle,
+    setScriptStyle,
 }: {
     provider: ProviderType
     setProvider: (p: ProviderType) => void
@@ -901,6 +942,8 @@ function SettingsGrid({
     setLanguage: (l: string) => void
     sceneCount: number
     setSceneCount: (n: number) => void
+    scriptStyle: ScriptWritingStyle
+    setScriptStyle: (s: ScriptWritingStyle) => void
 }) {
     const estimatedDuration = formatEstimatedDuration(sceneCount)
 
@@ -934,6 +977,18 @@ function SettingsGrid({
                     <option value="ja">Japanese</option>
                     <option value="ko">Korean</option>
                 </select>
+            </Field>
+            <Field label="Phong cách kịch bản">
+                <div className="flex flex-col gap-1.5">
+                    <select value={scriptStyle} onChange={e => setScriptStyle(e.target.value as ScriptWritingStyle)} className="input">
+                        {SCRIPT_WRITING_STYLE_OPTIONS.map(opt => (
+                            <option key={opt.id} value={opt.id}>{opt.label}</option>
+                        ))}
+                    </select>
+                    <div className="text-xs" style={{ color: 'var(--muted)' }}>
+                        {SCRIPT_WRITING_STYLE_OPTIONS.find(opt => opt.id === scriptStyle)?.description}
+                    </div>
+                </div>
             </Field>
             <Field label="Số phân cảnh (2–999)">
                 <div className="flex flex-col gap-1.5">

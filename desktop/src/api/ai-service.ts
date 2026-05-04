@@ -30,6 +30,10 @@ const DEFAULT_AI_TIMEOUT_MS = 180000
 const LONG_AI_TIMEOUT_MS = 420000
 const LONG_STORY_THRESHOLD_CHARS = 9000
 const LARGE_SCENE_THRESHOLD = 18
+const MAX_AI_RETRY_ATTEMPTS = 3
+const AI_RETRY_BASE_DELAY_MS = 1200
+const BATCH_STORY_CONTEXT_CHARS = 9000
+const BATCH_STORY_CONTEXT_FALLBACK_CHARS = 5500
 
 function timeoutSignal(timeoutMs?: number): AbortSignal {
     const normalized = Number.isFinite(timeoutMs) ? Math.max(30000, Number(timeoutMs)) : DEFAULT_AI_TIMEOUT_MS
@@ -197,6 +201,68 @@ function providerName(provider: ProviderType): string {
     if (provider === 'claude') return 'Claude'
     if (provider === 'deepseek') return 'DeepSeek'
     return 'OpenAI'
+}
+
+function waitMs(ms: number) {
+    return new Promise<void>(resolve => setTimeout(resolve, ms))
+}
+
+function isRetryableAIError(error: unknown): boolean {
+    const msg = String((error as any)?.message ?? error ?? '').toLowerCase()
+    return (
+        msg.includes('timeout') ||
+        msg.includes('timed out') ||
+        msg.includes('network') ||
+        msg.includes('fetch failed') ||
+        msg.includes('failed to fetch') ||
+        msg.includes('connection') ||
+        msg.includes('econn') ||
+        msg.includes('api error 429') ||
+        msg.includes('api error 500') ||
+        msg.includes('api error 502') ||
+        msg.includes('api error 503') ||
+        msg.includes('api error 504') ||
+        msg.includes('service unavailable') ||
+        msg.includes('temporarily unavailable') ||
+        msg.includes('all api keys exhausted')
+    )
+}
+
+function buildRetryTimeoutSequence(baseTimeoutMs?: number, attempts = MAX_AI_RETRY_ATTEMPTS): number[] {
+    const base = Number.isFinite(baseTimeoutMs) ? Math.max(30000, Number(baseTimeoutMs)) : DEFAULT_AI_TIMEOUT_MS
+    const sequence: number[] = []
+    for (let i = 0; i < attempts; i += 1) {
+        const scale = 1 + (i * 0.25)
+        sequence.push(Math.min(LONG_AI_TIMEOUT_MS, Math.floor(base * scale)))
+    }
+    return sequence
+}
+
+export async function aiGenerateWithRetry<T = unknown>(
+    prompt: string,
+    systemPrompt?: string,
+    providerOverride?: ProviderType,
+    options?: { timeoutMs?: number; retries?: number },
+): Promise<T> {
+    const retries = Math.max(1, options?.retries ?? MAX_AI_RETRY_ATTEMPTS)
+    const timeoutSeq = buildRetryTimeoutSequence(options?.timeoutMs, retries)
+    let lastErr: unknown = null
+
+    for (let attempt = 0; attempt < retries; attempt += 1) {
+        try {
+            return await aiGenerate<T>(prompt, systemPrompt, providerOverride, {
+                timeoutMs: timeoutSeq[Math.min(attempt, timeoutSeq.length - 1)],
+            })
+        } catch (error) {
+            lastErr = error
+            const canRetry = attempt < retries - 1 && isRetryableAIError(error)
+            if (!canRetry) break
+            const backoff = AI_RETRY_BASE_DELAY_MS * (attempt + 1)
+            await waitMs(backoff)
+        }
+    }
+
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'AI request failed'))
 }
 
 function isInvalidKeyResponse(status: number, bodyText: string): boolean {
@@ -438,6 +504,74 @@ function languageLabel(language: string): string {
     return language
 }
 
+export type ScriptWritingStyle = 'standard' | 'copywriting' | 'manga_drama' | 'dramatic'
+
+export const SCRIPT_WRITING_STYLE_OPTIONS: { id: ScriptWritingStyle; label: string; description: string }[] = [
+    {
+        id: 'standard',
+        label: 'Chuẩn (Cân bằng)',
+        description: 'Giữ phong cách cinematic-documentary cân bằng, an toàn và trung tính.',
+    },
+    {
+        id: 'copywriting',
+        label: 'Copywriting Hook',
+        description: 'Mạnh về hook, lợi ích rõ ràng, chuyển cảnh có nhịp mở-loop để giữ retention.',
+    },
+    {
+        id: 'manga_drama',
+        label: 'Manga Drama',
+        description: 'Nhịp kể theo phân cảnh manga/anime, cảm xúc rõ, hành động panel-by-panel.',
+    },
+    {
+        id: 'dramatic',
+        label: 'Dramatic Cinematic',
+        description: 'Đẩy cao tương phản, sân khấu hoá khung hình, căng thẳng và nhịp cao trào.',
+    },
+]
+
+function normalizeScriptWritingStyle(style: unknown): ScriptWritingStyle {
+    const raw = String(style ?? '').trim().toLowerCase()
+    if (raw === 'copywriting') return 'copywriting'
+    if (raw === 'manga_drama' || raw === 'manga-drama' || raw === 'manga') return 'manga_drama'
+    if (raw === 'dramatic') return 'dramatic'
+    return 'standard'
+}
+
+function scriptStylePromptBlock(style: ScriptWritingStyle, language: string): string {
+    const lang = languageLabel(language)
+    if (style === 'copywriting') {
+        return `STYLE PROFILE: COPYWRITING HOOK
+- Write for audience retention and persuasion (without fake claims).
+- First scenes must establish a sharp hook/problem tension quickly.
+- Make narration specific, benefit-driven, and concrete (names, dates, outcomes when available).
+- One core idea per scene; each scene should end with a micro open-loop into next scene.
+- Keep wording clear over clever; avoid buzzword fluff.
+- Narrator language must be ${lang}.`
+    }
+    if (style === 'manga_drama') {
+        return `STYLE PROFILE: MANGA DRAMA
+- Structure scenes like manga panels: setup -> motion beat -> emotion beat -> transition.
+- Emphasize character emotion and kinetic action rhythm, but keep image prompt appearance-neutral.
+- Use expressive cinematic verbs (snap, whip-pan, freeze, reveal, cut-in) with continuity.
+- Alternate shot scales to mimic panel pacing (wide / medium / close-up / reaction).
+- Maintain one coherent storyline arc with rising stakes and clean cliff transitions.
+- Narrator language must be ${lang}.`
+    }
+    if (style === 'dramatic') {
+        return `STYLE PROFILE: DRAMATIC CINEMATIC
+- Use bold, high-contrast staging and theatrical visual progression.
+- Prioritize tension curve: calm setup -> pressure rise -> conflict/reveal -> release.
+- Increase cinematic intensity through purposeful camera movement and composition changes.
+- Keep narration concise, confident, and emotionally charged (not melodramatic).
+- Avoid repetitive camera grammar; each adjacent scene should feel distinct in intent.
+- Narrator language must be ${lang}.`
+    }
+    return `STYLE PROFILE: STANDARD CINEMATIC
+- Keep balanced documentary storytelling with clear continuity.
+- Vary shot intent and pacing while preserving factual coherence.
+- Narrator language must be ${lang}.`
+}
+
 export async function researchTopic(topic: string, language: string, provider?: ProviderType): Promise<ResearchResult> {
     const prompt = `Research this topic for an AI video documentary: "${topic}"
 
@@ -454,7 +588,7 @@ Return JSON:
 }
 
 Base on your knowledge. Include specific dates, names, numbers when available.`
-    return aiGenerate<ResearchResult>(prompt, SYSTEM_PROMPT, provider)
+    return aiGenerateWithRetry<ResearchResult>(prompt, SYSTEM_PROMPT, provider)
 }
 
 export interface ExtractedProject {
@@ -505,6 +639,119 @@ const FALLBACK_VIDEO_PATTERNS: string[] = [
     '[00:00-00:02] Wide establishing shot. [00:02-00:06] Arc movement around the action for depth. [00:06-00:08] Cut on motion toward the next narrative beat.',
     '0-2s: Top-down or high-angle setup to orient geography. 2-6s: Drop to eye-level and track the action. 6-8s: End on a reaction beat that bridges to next scene.',
 ]
+
+const SHOT_INTENT_CYCLE = [
+    'establishing',
+    'reaction',
+    'detail insert',
+    'progressive reveal',
+    'transition bridge',
+    'climax beat',
+    'release beat',
+]
+
+const CAMERA_MOVE_CYCLE = [
+    'locked wide frame',
+    'slow dolly-in',
+    'lateral tracking',
+    'arc movement',
+    'handheld documentary motion',
+    'overhead tilt-down',
+    'rack focus + static hold',
+]
+
+const RHYTHM_CYCLE = [
+    '2s setup + 3s development + 3s payoff',
+    '4s build + 4s reveal',
+    'single-take 8s continuous motion',
+]
+
+function clampText(text: string, maxLen: number): string {
+    const clean = String(text || '').replace(/\s+/g, ' ').trim()
+    if (clean.length <= maxLen) return clean
+    return `${clean.slice(0, Math.max(0, maxLen - 3)).trim()}...`
+}
+
+function extractFirstSentence(text: string, maxLen = 140): string {
+    const clean = String(text || '').replace(/\s+/g, ' ').trim()
+    if (!clean) return ''
+    const sentence = clean.split(/[.!?](?:\s|$)/)[0] || clean
+    return clampText(sentence, maxLen)
+}
+
+function sceneDirectionLine(sceneNo: number, totalScenes: number, beatHint: string): string {
+    const intent = SHOT_INTENT_CYCLE[(sceneNo - 1) % SHOT_INTENT_CYCLE.length]
+    const camera = CAMERA_MOVE_CYCLE[(sceneNo - 1) % CAMERA_MOVE_CYCLE.length]
+    const rhythm = RHYTHM_CYCLE[(sceneNo - 1) % RHYTHM_CYCLE.length]
+    const phase = sceneNo <= Math.ceil(totalScenes * 0.25)
+        ? 'opening'
+        : sceneNo >= Math.floor(totalScenes * 0.75)
+            ? 'closing'
+            : 'middle'
+    return `Scene ${sceneNo}: phase=${phase}; intent=${intent}; camera=${camera}; rhythm=${rhythm}; beat_hint=${clampText(beatHint, 90) || 'continuity'}`
+}
+
+function buildSceneDirectionBlock(start: number, end: number, totalScenes: number, arcBeats: string[]): string {
+    const lines: string[] = []
+    const beats = arcBeats.length > 0 ? arcBeats : ['Maintain continuity and progression']
+    for (let sceneNo = start + 1; sceneNo <= end; sceneNo += 1) {
+        const beat = beats[(sceneNo - 1) % beats.length]
+        lines.push(sceneDirectionLine(sceneNo, totalScenes, beat))
+    }
+    return lines.join('\n')
+}
+
+function detectPromptStyle(videoPrompt: string): 'legacy_036' | 'timestamp' | 'two_phase' | 'single_take' | 'other' {
+    const v = videoPrompt.toLowerCase()
+    if (/\b0\s*-\s*3s\b/.test(v) && /\b3\s*-\s*6s\b/.test(v) && /\b6\s*-\s*8s\b/.test(v)) return 'legacy_036'
+    if (/\[?\s*00:00\s*-\s*00:0[23]\s*\]?/.test(v)) return 'timestamp'
+    if (/\b0\s*-\s*4s\b/.test(v) && /\b4\s*-\s*8s\b/.test(v)) return 'two_phase'
+    if (v.includes('single-take') || v.includes('continuous')) return 'single_take'
+    return 'other'
+}
+
+function parseLegacyPromptSegments(videoPrompt: string): [string, string, string] | null {
+    const match = videoPrompt.match(/0\s*-\s*3s\s*:\s*([\s\S]*?)\s*3\s*-\s*6s\s*:\s*([\s\S]*?)\s*6\s*-\s*8s\s*:\s*([\s\S]*)/i)
+    if (!match) return null
+    const a = clampText(match[1], 200)
+    const b = clampText(match[2], 200)
+    const c = clampText(match[3], 220)
+    if (!a && !b && !c) return null
+    return [a || 'Set the scene', b || 'Develop action', c || 'Resolve with transition']
+}
+
+function rewriteLegacyPrompt(videoPrompt: string, scenePrompt: string, index: number): string {
+    const segments = parseLegacyPromptSegments(videoPrompt)
+    const anchor = extractFirstSentence(scenePrompt, 120)
+    const fallback = buildFallbackVideoPrompt(index)
+    if (!segments) return fallback
+    const [a, b, c] = segments
+    const variant = index % 3
+    if (variant === 0) {
+        return `[00:00-00:02] ${a}. [00:02-00:05] ${b}. [00:05-00:08] ${c}.`
+    }
+    if (variant === 1) {
+        return `0-4s: ${a}; then ${b}. 4-8s: ${c}.`
+    }
+    return `Single-take over 8 seconds: ${anchor ? `${anchor}. ` : ''}${a}; transition through ${b}; finish with ${c}.`
+}
+
+function diversifyVideoPromptStructures(scenes: ExtractedScene[]): ExtractedScene[] {
+    if (scenes.length < 4) return scenes
+    const styles = scenes.map(scene => detectPromptStyle(scene.video_prompt || ''))
+    const legacyCount = styles.filter(style => style === 'legacy_036').length
+    if (legacyCount / scenes.length < 0.5) return scenes
+
+    return scenes.map((scene, index) => {
+        const style = styles[index]
+        if (style !== 'legacy_036') return scene
+        if (index === 0 || index % 3 === 0) return scene
+        return {
+            ...scene,
+            video_prompt: rewriteLegacyPrompt(scene.video_prompt, scene.prompt, index),
+        }
+    })
+}
 
 function normalizeStringArray(raw: unknown, limit = 20): string[] {
     if (!Array.isArray(raw)) return []
@@ -593,6 +840,8 @@ function compactStoryForPrompt(story: string, maxChars = 22000): string {
 }
 
 function sceneBatchSize(sceneCount: number): number {
+    if (sceneCount >= 120) return 12
+    if (sceneCount >= 80) return 10
     if (sceneCount >= 60) return 10
     if (sceneCount >= 32) return 8
     if (sceneCount >= 20) return 7
@@ -618,12 +867,20 @@ interface StoryBlueprint {
     pacingNotes: string[]
 }
 
-async function buildStoryBlueprint(story: string, language: string, provider?: ProviderType): Promise<StoryBlueprint> {
+async function buildStoryBlueprint(
+    story: string,
+    language: string,
+    provider?: ProviderType,
+    scriptStyle: ScriptWritingStyle = 'standard',
+): Promise<StoryBlueprint> {
     const lang = languageLabel(language)
+    const styleGuide = scriptStylePromptBlock(scriptStyle, language)
     const prompt = `Create a compact production blueprint for a long-form AI video project.
 
 STORY:
 ${compactStoryForPrompt(story)}
+
+${styleGuide}
 
 Return JSON only:
 {
@@ -646,7 +903,7 @@ RULES:
 - Include all important entities in characters
 - Output valid JSON only`
 
-    const raw = await aiGenerate<{
+    const raw = await aiGenerateWithRetry<{
         description?: unknown
         characters?: unknown
         arc_beats?: unknown
@@ -668,13 +925,15 @@ async function generateScenesInBatches(
     language: string,
     sceneCount: number,
     blueprint: StoryBlueprint,
-    provider?: ProviderType
+    provider?: ProviderType,
+    scriptStyle: ScriptWritingStyle = 'standard',
 ): Promise<ExtractedScene[]> {
     const lang = languageLabel(language)
     const batch = sceneBatchSize(sceneCount)
     const generated: ExtractedScene[] = []
     const totalBatches = Math.ceil(sceneCount / batch)
-    const storySnippet = compactStoryForPrompt(story, 12000)
+    const storySnippet = compactStoryForPrompt(story, BATCH_STORY_CONTEXT_CHARS)
+    const styleGuide = scriptStylePromptBlock(scriptStyle, language)
 
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
         const start = batchIndex * batch
@@ -687,6 +946,7 @@ async function generateScenesInBatches(
             return `Scene ${no}: narrator="${scene.narrator_text}" | prompt="${scene.prompt}"`
         }).join('\n')
         const arcBeats = pickArcBeatsForRange(blueprint.arcBeats, start, end, sceneCount)
+        const sceneDirectionPlan = buildSceneDirectionBlock(start, end, sceneCount, arcBeats)
         const prompt = `Create scenes ${sceneFrom}-${sceneTo} of ${sceneCount} for one coherent episode.
 
 PROJECT DESCRIPTION:
@@ -701,11 +961,16 @@ ${blueprint.visualLanguage.map((item, idx) => `${idx + 1}. ${item}`).join('\n') 
 PACING NOTES:
 ${blueprint.pacingNotes.map((item, idx) => `${idx + 1}. ${item}`).join('\n') || '- Rhythmic pacing with clear transitions'}
 
+${styleGuide}
+
 SHORT STORY CONTEXT:
 ${storySnippet}
 
 LAST GENERATED SCENES (continuity anchor):
 ${previousContext || 'None (this is the first batch)'}
+
+SCENE-BY-SCENE DIRECTION (must vary shot grammar):
+${sceneDirectionPlan}
 
 Return JSON:
 {
@@ -724,14 +989,48 @@ RULES:
 - Keep strict continuity with previous scenes
 - Image prompt must avoid character appearance details
 ${VIDEO_PROMPT_VARIETY_RULES}`
+        let raw: { scenes?: unknown } | null = null
+        try {
+            raw = await aiGenerateWithRetry<{ scenes?: unknown }>(prompt, SYSTEM_PROMPT, provider, { timeoutMs: LONG_AI_TIMEOUT_MS, retries: 3 })
+        } catch {
+            // Retry with lighter context for very long/complex projects.
+            const compactPrompt = `Create scenes ${sceneFrom}-${sceneTo} of ${sceneCount}.
+Project: ${blueprint.description || 'documentary storytelling'}
+Arc beats:
+${arcBeats.map((beat, idx) => `${idx + 1}. ${beat}`).join('\n') || '- continuity'}
+Story context:
+${compactStoryForPrompt(story, BATCH_STORY_CONTEXT_FALLBACK_CHARS)}
+Directions:
+${sceneDirectionPlan}
 
-        const raw = await aiGenerate<{ scenes?: unknown }>(prompt, SYSTEM_PROMPT, provider, { timeoutMs: LONG_AI_TIMEOUT_MS })
+${styleGuide}
+
+Return JSON:
+{
+  "scenes": [
+    {
+      "prompt": "IMAGE PROMPT in English, action + setting only, max 2 sentences",
+      "video_prompt": "Detailed motion plan optimized for Veo",
+      "narrator_text": "Narration in ${lang}, 1-2 sentences",
+      "character_names": ["character names"]
+    }
+  ]
+}
+
+Rules:
+- Exactly ${count} scenes
+- Keep continuity
+- Avoid repetitive timing template across all scenes
+${VIDEO_PROMPT_VARIETY_RULES}`
+            raw = await aiGenerateWithRetry<{ scenes?: unknown }>(compactPrompt, SYSTEM_PROMPT, provider, { timeoutMs: LONG_AI_TIMEOUT_MS, retries: 2 })
+        }
+
         let batchScenes = normalizeSceneArray(raw?.scenes)
         batchScenes = ensureExactSceneCount(batchScenes, count)
         generated.push(...batchScenes)
     }
 
-    return generated.slice(0, sceneCount)
+    return diversifyVideoPromptStructures(generated.slice(0, sceneCount))
 }
 
 function ensureExactSceneCount(scenes: ExtractedScene[], targetCount: number): ExtractedScene[] {
@@ -749,9 +1048,11 @@ async function rebalanceScenesWithAI(
     language: string,
     sceneCount: number,
     sourceScenes: ExtractedScene[],
-    provider?: ProviderType
+    provider?: ProviderType,
+    scriptStyle: ScriptWritingStyle = 'standard',
 ): Promise<ExtractedScene[] | null> {
     const lang = languageLabel(language)
+    const styleGuide = scriptStylePromptBlock(scriptStyle, language)
     const prompt = `Rewrite the scenes below to exactly ${sceneCount} scenes for one coherent episode.
 
 STORY:
@@ -759,6 +1060,8 @@ ${story}
 
 CURRENT SCENES JSON:
 ${JSON.stringify(sourceScenes)}
+
+${styleGuide}
 
 Return JSON only:
 {
@@ -778,17 +1081,27 @@ RULES:
 - Do not describe character appearance in image prompt
 ${VIDEO_PROMPT_VARIETY_RULES}`
 
-    const repaired = await aiGenerate<{ scenes?: unknown }>(prompt, SYSTEM_PROMPT, provider, { timeoutMs: LONG_AI_TIMEOUT_MS })
+    const repaired = await aiGenerateWithRetry<{ scenes?: unknown }>(prompt, SYSTEM_PROMPT, provider, { timeoutMs: LONG_AI_TIMEOUT_MS })
     const scenes = normalizeSceneArray(repaired?.scenes)
-    return scenes.length > 0 ? scenes : null
+    return scenes.length > 0 ? diversifyVideoPromptStructures(scenes) : null
 }
 
-export async function analyzeStory(story: string, language: string, sceneCount = 8, provider?: ProviderType): Promise<ExtractedProject> {
+export async function analyzeStory(
+    story: string,
+    language: string,
+    sceneCount = 8,
+    provider?: ProviderType,
+    scriptStyle: ScriptWritingStyle = 'standard',
+): Promise<ExtractedProject> {
     const lang = languageLabel(language)
+    const style = normalizeScriptWritingStyle(scriptStyle)
+    const styleGuide = scriptStylePromptBlock(style, language)
     const prompt = `Analyze this story for AI video generation. Extract exactly ${sceneCount} scenes.
 
 STORY:
 ${compactStoryForPrompt(story)}
+
+${styleGuide}
 
 Return JSON with this schema:
 {
@@ -824,8 +1137,8 @@ ${VIDEO_PROMPT_VARIETY_RULES}`
 
     if (useChunked) {
         try {
-            const blueprint = await buildStoryBlueprint(story, language, provider)
-            const scenes = await generateScenesInBatches(story, language, sceneCount, blueprint, provider)
+            const blueprint = await buildStoryBlueprint(story, language, provider, style)
+            const scenes = await generateScenesInBatches(story, language, sceneCount, blueprint, provider, style)
             raw = {
                 description: blueprint.description,
                 characters: blueprint.characters,
@@ -837,7 +1150,7 @@ ${VIDEO_PROMPT_VARIETY_RULES}`
     }
 
     if (!raw) {
-        raw = await aiGenerate<ExtractedProject>(prompt, SYSTEM_PROMPT, provider, {
+        raw = await aiGenerateWithRetry<ExtractedProject>(prompt, SYSTEM_PROMPT, provider, {
             timeoutMs: useChunked ? LONG_AI_TIMEOUT_MS : DEFAULT_AI_TIMEOUT_MS,
         })
     }
@@ -848,14 +1161,14 @@ ${VIDEO_PROMPT_VARIETY_RULES}`
 
     if (scenes.length !== sceneCount) {
         try {
-            const repaired = await rebalanceScenesWithAI(story, language, sceneCount, scenes, provider)
+            const repaired = await rebalanceScenesWithAI(story, language, sceneCount, scenes, provider, style)
             if (repaired && repaired.length > 0) scenes = repaired
         } catch {
             // Keep best-effort local normalization below.
         }
     }
 
-    scenes = ensureExactSceneCount(scenes, sceneCount)
+    scenes = diversifyVideoPromptStructures(ensureExactSceneCount(scenes, sceneCount))
     if (scenes.length === 0) {
         throw new Error('AI did not return any valid scenes')
     }

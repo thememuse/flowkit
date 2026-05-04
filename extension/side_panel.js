@@ -38,10 +38,23 @@ const TYPE_LABELS = {
 
 let _activeProjectId = '';
 let _projectPollTimer = null;
+let _statusPollTimer = null;
 let _keepAlivePort = null;
 let _keepAliveTimer = null;
 let _lastReconnectKickAt = 0;
+let _lastTokenRefreshKickAt = 0;
+let _localStatus = null;
+let _backendStatus = null;
+let _dashboardWs = null;
+let _dashboardReconnectTimer = null;
+let _dashboardConnected = false;
+let _extensionLogEntries = [];
+const _dashboardLogEntries = new Map();
 const PROJECT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BACKEND_BASE = 'http://127.0.0.1:8100';
+const STATUS_POLL_MS = 5000;
+const RECONNECT_BACKOFF_MS = 12000;
+const TOKEN_REFRESH_BACKOFF_MS = 60000;
 
 function normalizeProjectId(value) {
   const raw = String(value || '').trim().toLowerCase();
@@ -62,6 +75,80 @@ function inferProjectIdFromEntries(entries) {
 function formatType(type) {
   if (!type) return '—';
   return TYPE_LABELS[type] || type.slice(0, 5).toUpperCase();
+}
+
+function mapLocalStatus(data) {
+  if (!data || typeof data !== 'object') return null;
+  return {
+    source: 'local',
+    connected: !!data.connected,
+    agentConnected: data.agentConnected !== undefined ? !!data.agentConnected : !!data.connected,
+    state: String(data.state || 'off').toLowerCase(),
+    manualDisconnect: !!data.manualDisconnect,
+    flowKeyPresent: !!data.flowKeyPresent,
+    tokenAge: Number(data.tokenAge || 0) || 0,
+    tokenAuthState: String(data.tokenAuthState || data.metrics?.tokenAuthState || 'unknown'),
+    tokenAuthCheckedAt: data.tokenAuthCheckedAt || data.metrics?.tokenAuthCheckedAt || null,
+    tokenAuthError: String(data.tokenAuthError || data.metrics?.tokenAuthError || ''),
+    metrics: data.metrics || {},
+    activeProjectId: normalizeProjectId(data.activeProjectId || data.projectId || ''),
+  };
+}
+
+function mapBackendStatus(health, runtime) {
+  if (!health || !runtime) return null;
+  const state = String(runtime.state || health.extension_state || 'off').toLowerCase();
+  const manualDisconnect = !!(runtime.manual_disconnect ?? health.extension_manual_disconnect ?? false);
+  const runtimeConnected = runtime.runtime_connected !== undefined
+    ? !!runtime.runtime_connected
+    : (!!runtime.connected && state !== 'off' && !manualDisconnect);
+  const flowKeyPresent = !!(runtime.flow_key_present ?? runtime.flowKeyPresent ?? false);
+  return {
+    source: 'backend',
+    connected: runtimeConnected,
+    agentConnected: runtimeConnected,
+    state: runtimeConnected ? (state || 'idle') : 'off',
+    manualDisconnect,
+    flowKeyPresent,
+    tokenAge: Number(runtime.token_age_ms ?? runtime.tokenAge ?? 0) || 0,
+    tokenAuthState: String(runtime.token_auth_state || runtime.tokenAuthState || runtime.metrics?.tokenAuthState || 'unknown'),
+    tokenAuthCheckedAt: runtime.token_auth_checked_at || runtime.tokenAuthCheckedAt || runtime.metrics?.tokenAuthCheckedAt || null,
+    tokenAuthError: String(runtime.token_auth_error || runtime.tokenAuthError || runtime.metrics?.tokenAuthError || ''),
+    metrics: runtime.metrics || {},
+    activeProjectId: normalizeProjectId(runtime.active_project_id || runtime.activeProjectId || ''),
+  };
+}
+
+function requestReconnect(reason = 'unknown') {
+  const now = Date.now();
+  if (now - _lastReconnectKickAt < RECONNECT_BACKOFF_MS) return;
+  _lastReconnectKickAt = now;
+  try {
+    chrome.runtime.sendMessage({ type: 'RECONNECT', reason }, () => {});
+  } catch {
+    // ignore
+  }
+}
+
+function getEffectiveStatus() {
+  return _backendStatus || _localStatus;
+}
+
+function renderEffectiveStatus() {
+  const effective = getEffectiveStatus();
+  if (!effective) return;
+  updateStatus(effective);
+
+  const backendConnected = !!_backendStatus?.connected;
+  const localConnected = !!_localStatus?.connected;
+  if (backendConnected && !localConnected && !_backendStatus?.manualDisconnect) {
+    requestReconnect('status_mismatch_backend_on_local_off');
+    return;
+  }
+
+  if (!effective.connected && !effective.manualDisconnect) {
+    requestReconnect('effective_offline_auto_recover');
+  }
 }
 
 // ── Time formatting ──────────────────────────────────────────
@@ -86,7 +173,7 @@ function updateStatus(data) {
 
   // Connection dot
   const dot = document.getElementById('conn-dot');
-  const connected = data.agentConnected;
+  const connected = !!(data.connected ?? data.agentConnected);
   dot.className = connected ? 'on' : '';
 
   // Toggle state
@@ -114,7 +201,12 @@ function updateStatus(data) {
     || data.metrics?.tokenAuthError
     || '',
   );
-  if (data.flowKeyPresent) {
+  if (!connected || st === 'off') {
+    tokenEl.textContent = data.manualDisconnect
+      ? 'runtime OFF (manual)'
+      : 'runtime OFF — auto reconnect';
+    tokenEl.className = 'warn';
+  } else if (data.flowKeyPresent) {
     const ageMs = data.tokenAge || 0;
     const ageMin = Math.round(ageMs / 60000);
     if (tokenAuthState === 'invalid') {
@@ -129,12 +221,16 @@ function updateStatus(data) {
       tokenEl.textContent = `token stale ${ageMin}m — open Flow to refresh`;
       tokenEl.className = 'warn';
     } else {
-      tokenEl.textContent = `token synced ${ageMin}m (pending verify)`;
+      tokenEl.textContent = `token synced ${ageMin}m · pending verify`;
       tokenEl.className = 'warn';
     }
     // Auto-refresh when token age > 55 min and not yet verified valid.
-    if (ageMs > 3300000 && data.agentConnected && tokenAuthState !== 'valid') {
-      chrome.runtime.sendMessage({ type: 'REFRESH_TOKEN' });
+    if (ageMs > 3300000 && connected && tokenAuthState !== 'valid') {
+      const now = Date.now();
+      if (now - _lastTokenRefreshKickAt > TOKEN_REFRESH_BACKOFF_MS) {
+        _lastTokenRefreshKickAt = now;
+        chrome.runtime.sendMessage({ type: 'REFRESH_TOKEN' }, () => {});
+      }
     }
   } else {
     tokenEl.textContent = 'no token';
@@ -151,20 +247,88 @@ function updateStatus(data) {
   if (runtimeProjectId) {
     setProjectId(runtimeProjectId);
   }
-
-  // Auto-heal: if user did not manually disconnect but WS is down, trigger reconnect.
-  if (!connected && !data.manualDisconnect) {
-    const now = Date.now();
-    if (now - _lastReconnectKickAt > 5000) {
-      _lastReconnectKickAt = now;
-      chrome.runtime.sendMessage({ type: 'RECONNECT' }).catch(() => {});
-    }
-  }
 }
 
 // ── Request log ──────────────────────────────────────────────
 
 function updateRequestLog(entries) {
+  _extensionLogEntries = Array.isArray(entries) ? entries : [];
+  renderRequestLog(collectMergedLogEntries());
+}
+
+function normalizeEntryStatus(status) {
+  const raw = String(status || '').toUpperCase();
+  if (raw === 'SUCCESS') return 'COMPLETED';
+  if (raw === 'FAILED') return 'FAILED';
+  if (raw === 'PROCESSING') return 'PROCESSING';
+  if (raw === 'PENDING') return 'PENDING';
+  if (raw === 'COMPLETED') return 'COMPLETED';
+  return status || 'PENDING';
+}
+
+function dashboardPayloadToEntry(payload, timestamp) {
+  if (!payload || typeof payload !== 'object') return null;
+  const id = payload.id ? String(payload.id) : '';
+  if (!id) return null;
+  return {
+    id,
+    type: payload.type || 'API',
+    time: timestamp || payload.updated_at || payload.created_at || new Date().toISOString(),
+    status: normalizeEntryStatus(payload.status),
+    error: payload.error || payload.error_message || payload.message || null,
+    outputUrl: payload.output_url || null,
+    projectId: normalizeProjectId(payload.project_id || payload.projectId || ''),
+    payloadSummary: payload.scene_id
+      ? `scene=${String(payload.scene_id).slice(0, 8)}`
+      : (payload.character_id ? `character=${String(payload.character_id).slice(0, 8)}` : null),
+    source: 'dashboard',
+  };
+}
+
+function upsertDashboardEntry(entry) {
+  if (!entry?.id) return;
+  const prev = _dashboardLogEntries.get(entry.id) || {};
+  _dashboardLogEntries.set(entry.id, { ...prev, ...entry });
+  if (_dashboardLogEntries.size > 500) {
+    const rows = Array.from(_dashboardLogEntries.values()).sort((a, b) => {
+      const ta = new Date(a?.time || 0).getTime();
+      const tb = new Date(b?.time || 0).getTime();
+      return tb - ta;
+    });
+    _dashboardLogEntries.clear();
+    rows.slice(0, 350).forEach((row) => {
+      if (row?.id) _dashboardLogEntries.set(row.id, row);
+    });
+  }
+}
+
+function collectMergedLogEntries() {
+  const byId = new Map();
+  _extensionLogEntries.forEach((entry) => {
+    if (!entry?.id) return;
+    byId.set(entry.id, { ...entry, source: 'extension' });
+  });
+  _dashboardLogEntries.forEach((entry, id) => {
+    if (!id) return;
+    const prev = byId.get(id);
+    if (!prev) {
+      byId.set(id, entry);
+      return;
+    }
+    byId.set(id, {
+      ...entry,
+      ...prev,
+      status: normalizeEntryStatus(prev.status || entry.status),
+      error: prev.error || entry.error || null,
+      projectId: normalizeProjectId(prev.projectId || prev.project_id || entry.projectId || ''),
+    });
+  });
+  return Array.from(byId.values())
+    .sort((a, b) => new Date(b?.time || 0).getTime() - new Date(a?.time || 0).getTime())
+    .slice(0, 400);
+}
+
+function renderRequestLog(entries) {
   const tbody = document.getElementById('log-body');
   const countEl = document.getElementById('log-count');
 
@@ -370,8 +534,37 @@ document.getElementById('detail-overlay').addEventListener('click', (e) => {
 function fetchStatus() {
   chrome.runtime.sendMessage({ type: 'STATUS' }, (data) => {
     if (chrome.runtime.lastError) return;
-    updateStatus(data);
+    _localStatus = mapLocalStatus(data);
+    renderEffectiveStatus();
   });
+}
+
+async function fetchBackendStatus() {
+  try {
+    const [healthRes, runtimeRes] = await Promise.all([
+      fetch(`${BACKEND_BASE}/health?_=${Date.now()}`, {
+        cache: 'no-store',
+        headers: {
+          'Cache-Control': 'no-cache, no-store, max-age=0',
+          Pragma: 'no-cache',
+        },
+      }),
+      fetch(`${BACKEND_BASE}/api/flow/status?_=${Date.now()}`, {
+        cache: 'no-store',
+        headers: {
+          'Cache-Control': 'no-cache, no-store, max-age=0',
+          Pragma: 'no-cache',
+        },
+      }),
+    ]);
+    if (!healthRes.ok || !runtimeRes.ok) throw new Error('backend status unavailable');
+    const [health, runtime] = await Promise.all([healthRes.json(), runtimeRes.json()]);
+    _backendStatus = mapBackendStatus(health, runtime);
+  } catch {
+    _backendStatus = null;
+  } finally {
+    renderEffectiveStatus();
+  }
 }
 
 function fetchLog() {
@@ -386,6 +579,7 @@ function fetchLog() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'STATUS_PUSH') {
     fetchStatus();
+    void fetchBackendStatus();
   }
   if (msg.type === 'REQUEST_LOG_UPDATE') {
     if (msg.log) updateRequestLog(msg.log);
@@ -453,13 +647,88 @@ function connectKeepAlivePort() {
   }, 10000);
 }
 
+function applyDashboardSnapshot(rows) {
+  _dashboardLogEntries.clear();
+  if (!Array.isArray(rows)) return;
+  rows.forEach((row) => {
+    const entry = dashboardPayloadToEntry(row, row?.updated_at || row?.created_at);
+    if (entry) upsertDashboardEntry(entry);
+  });
+}
+
+function handleDashboardMessage(raw) {
+  if (!raw) return;
+  let msg = null;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!msg || typeof msg !== 'object') return;
+
+  if (msg.type === 'snapshot') {
+    applyDashboardSnapshot(msg.requests || []);
+    renderRequestLog(collectMergedLogEntries());
+    return;
+  }
+  if (msg.type === 'ping') return;
+  if (msg.type !== 'request_update' && msg.type !== 'request_failed' && msg.type !== 'request_completed') {
+    return;
+  }
+  const entry = dashboardPayloadToEntry(msg.data || {}, msg.timestamp || new Date().toISOString());
+  if (!entry) return;
+  upsertDashboardEntry(entry);
+  renderRequestLog(collectMergedLogEntries());
+}
+
+function connectDashboardWs() {
+  if (_dashboardWs && (_dashboardWs.readyState === WebSocket.OPEN || _dashboardWs.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (_dashboardReconnectTimer) {
+    clearTimeout(_dashboardReconnectTimer);
+    _dashboardReconnectTimer = null;
+  }
+
+  try {
+    _dashboardWs = new WebSocket('ws://127.0.0.1:8100/ws/dashboard');
+  } catch {
+    _dashboardWs = null;
+    _dashboardConnected = false;
+    _dashboardReconnectTimer = setTimeout(connectDashboardWs, 2000);
+    return;
+  }
+
+  _dashboardWs.onopen = () => {
+    _dashboardConnected = true;
+  };
+  _dashboardWs.onmessage = (ev) => {
+    handleDashboardMessage(ev?.data);
+  };
+  _dashboardWs.onerror = () => {
+    _dashboardConnected = false;
+  };
+  _dashboardWs.onclose = () => {
+    _dashboardConnected = false;
+    _dashboardWs = null;
+    _dashboardReconnectTimer = setTimeout(connectDashboardWs, 2000);
+  };
+}
+
 // ── Init ─────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
   connectKeepAlivePort();
+  connectDashboardWs();
   fetchStatus();
+  void fetchBackendStatus();
   fetchLog();
   fetchProjectId();
+  if (_statusPollTimer) clearInterval(_statusPollTimer);
+  _statusPollTimer = setInterval(() => {
+    fetchStatus();
+    void fetchBackendStatus();
+  }, STATUS_POLL_MS);
   if (_projectPollTimer) clearInterval(_projectPollTimer);
   _projectPollTimer = setInterval(fetchProjectId, 3000);
 });

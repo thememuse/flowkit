@@ -1,12 +1,14 @@
 """Workflow helper endpoints for CLI parity features."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import shutil
 import subprocess
 import tempfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -16,7 +18,7 @@ import aiohttp
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agent.config import BASE_DIR, OUTPUT_DIR
+from agent.config import BASE_DIR, OUTPUT_DIR, MAX_CONCURRENT_REQUESTS
 from agent.db import crud
 from agent.sdk.persistence.sqlite_repository import SQLiteRepository
 from agent.utils.orientation import normalize_orientation
@@ -24,6 +26,8 @@ from agent.utils.paths import resolve_4k_file, scene_tts_path
 from agent.utils.slugify import slugify
 from agent.services.video_reviewer import review_video
 from agent.services.local_upscaler import local_upscale_health as get_local_upscale_health
+from agent.services.flow_client import get_flow_client
+from agent.worker.processor import get_worker_controller
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 logger = logging.getLogger(__name__)
@@ -180,6 +184,141 @@ class YouTubeReferenceResponse(BaseModel):
     transcript_chars: int
     transcript_truncated: bool
     transcript: str
+
+
+class StatuslineResponse(BaseModel):
+    line: str
+    project_id: Optional[str] = None
+    video_id: Optional[str] = None
+    extension_connected: bool = False
+    worker_active: int = 0
+    worker_slots: int = 0
+    counts: dict[str, int] = Field(default_factory=dict)
+    queue: dict[str, int] = Field(default_factory=dict)
+    suggested_next_action: Optional[str] = None
+
+
+class MonitorStartRequest(BaseModel):
+    project_id: str = Field(..., min_length=4)
+    video_id: Optional[str] = None
+    orientation: Optional[str] = None
+    interval_sec: int = Field(default=30, ge=5, le=300)
+    summary_every_cycles: int = Field(default=5, ge=1, le=50)
+    milestone_step: int = Field(default=10, ge=5, le=50)
+    auto_download_upscales: bool = False
+    stop_when_done: bool = False
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+
+
+class MonitorStopRequest(BaseModel):
+    project_id: str = Field(..., min_length=4)
+    video_id: Optional[str] = None
+
+
+class MonitorStateResponse(BaseModel):
+    key: str
+    running: bool
+    project_id: str
+    video_id: Optional[str] = None
+    orientation: Optional[str] = None
+    interval_sec: int
+    cycle: int
+    started_at: str
+    last_tick_at: Optional[str] = None
+    last_change_at: Optional[str] = None
+    auto_download_upscales: bool = False
+    stop_when_done: bool = False
+    telegram_enabled: bool = False
+    summary_every_cycles: int = 5
+    milestone_step: int = 10
+    latest_statusline: Optional[str] = None
+    latest_snapshot: Optional[dict[str, Any]] = None
+    latest_error: Optional[str] = None
+    logs: list[str] = Field(default_factory=list)
+
+
+class MonitorStateListResponse(BaseModel):
+    monitors: list[MonitorStateResponse] = Field(default_factory=list)
+    active_count: int = 0
+
+
+class _MonitorJob:
+    def __init__(self, body: MonitorStartRequest):
+        self._key = _monitor_key(body.project_id, body.video_id)
+        self.project_id = body.project_id
+        self.video_id = body.video_id
+        self.orientation = normalize_orientation(body.orientation or "VERTICAL")
+        self.interval_sec = body.interval_sec
+        self.summary_every_cycles = body.summary_every_cycles
+        self.milestone_step = body.milestone_step
+        self.auto_download_upscales = body.auto_download_upscales
+        self.stop_when_done = body.stop_when_done
+        self.telegram_bot_token = (body.telegram_bot_token or "").strip()
+        self.telegram_chat_id = (body.telegram_chat_id or "").strip()
+        self.telegram_enabled = bool(self.telegram_bot_token and self.telegram_chat_id)
+        self.running = True
+        now = datetime.now(timezone.utc)
+        self.started_at = now
+        self.last_tick_at: Optional[datetime] = None
+        self.last_change_at: Optional[datetime] = None
+        self.latest_statusline: Optional[str] = None
+        self.latest_snapshot: Optional[dict[str, Any]] = None
+        self.latest_error: Optional[str] = None
+        self.cycle = 0
+        self.logs: deque[str] = deque(maxlen=120)
+        self._stop_event = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+
+    @property
+    def key(self) -> str:
+        return self._key
+
+    def append_log(self, line: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.logs.appendleft(f"{stamp} · {line}")
+
+    def to_payload(self) -> MonitorStateResponse:
+        return MonitorStateResponse(
+            key=self.key,
+            running=self.running,
+            project_id=self.project_id,
+            video_id=self.video_id,
+            orientation=self.orientation,
+            interval_sec=self.interval_sec,
+            cycle=self.cycle,
+            started_at=self.started_at.isoformat(),
+            last_tick_at=self.last_tick_at.isoformat() if self.last_tick_at else None,
+            last_change_at=self.last_change_at.isoformat() if self.last_change_at else None,
+            auto_download_upscales=self.auto_download_upscales,
+            stop_when_done=self.stop_when_done,
+            telegram_enabled=self.telegram_enabled,
+            summary_every_cycles=self.summary_every_cycles,
+            milestone_step=self.milestone_step,
+            latest_statusline=self.latest_statusline,
+            latest_snapshot=self.latest_snapshot,
+            latest_error=self.latest_error,
+            logs=list(self.logs),
+        )
+
+    async def stop(self):
+        self.running = False
+        self._stop_event.set()
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+
+_MONITOR_JOBS: dict[str, _MonitorJob] = {}
+
+
+def _monitor_key(project_id: str, video_id: Optional[str]) -> str:
+    return f"{project_id}:{video_id or ''}"
 
 
 @router.get("/local-upscale/health")
@@ -832,32 +971,32 @@ async def list_channels():
     return rows
 
 
-@router.get("/status")
-async def workflow_status(
-    project_id: Optional[str] = Query(None),
-    video_id: Optional[str] = Query(None),
-):
-    """Aggregated status dashboard (fk:status + fk:monitor parity)."""
-    if not project_id:
-        projects = await crud.list_projects()
-        out = []
-        for p in projects:
-            pid = _obj(p, "id")
-            videos = await _repo.list_videos(pid)
-            out.append(
-                {
-                    "id": pid,
-                    "name": _obj(p, "name"),
-                    "status": _obj(p, "status"),
-                    "tier": _obj(p, "user_paygate_tier"),
-                    "orientation": normalize_orientation(_obj(p, "orientation")),
-                    "material": _obj(p, "material"),
-                    "video_count": len(videos),
-                    "created_at": _obj(p, "created_at"),
-                }
-            )
-        return {"projects": out, "count": len(out)}
+async def _list_project_status_summaries() -> dict[str, Any]:
+    projects = await crud.list_projects()
+    out = []
+    for p in projects:
+        pid = _obj(p, "id")
+        videos = await _repo.list_videos(pid)
+        out.append(
+            {
+                "id": pid,
+                "name": _obj(p, "name"),
+                "status": _obj(p, "status"),
+                "tier": _obj(p, "user_paygate_tier"),
+                "orientation": normalize_orientation(_obj(p, "orientation")),
+                "material": _obj(p, "material"),
+                "video_count": len(videos),
+                "created_at": _obj(p, "created_at"),
+            }
+        )
+    return {"projects": out, "count": len(out)}
 
+
+async def _build_workflow_status_payload(
+    *,
+    project_id: str,
+    video_id: Optional[str] = None,
+) -> dict[str, Any]:
     project = await _repo.get_project(project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -893,8 +1032,9 @@ async def workflow_status(
     refs_total = len(characters)
     refs_done = sum(1 for c in characters if _obj(c, "media_id"))
     scenes_total = len(scenes)
-    images_done = sum(1 for s in scenes if _obj(s, f"{prefix}_image_status") == "COMPLETED")
-    videos_done = sum(1 for s in scenes if _obj(s, f"{prefix}_video_status") == "COMPLETED")
+    # Manual-only policy: treat stage readiness by persisted media presence.
+    images_done = sum(1 for s in scenes if _obj(s, f"{prefix}_image_media_id"))
+    videos_done = sum(1 for s in scenes if _obj(s, f"{prefix}_video_media_id"))
     upscales_done = sum(1 for s in scenes if _obj(s, f"{prefix}_upscale_status") == "COMPLETED")
     tts_total = sum(1 for s in scenes if (_obj(s, "narrator_text") or "").strip())
     tts_done = sum(
@@ -940,6 +1080,9 @@ async def workflow_status(
             "prompt": _obj(s, "prompt"),
             "character_names": _obj(s, "character_names"),
             "narrator_text": narrator_text,
+            "image_media_id": _obj(s, f"{prefix}_image_media_id"),
+            "video_media_id": _obj(s, f"{prefix}_video_media_id"),
+            "upscale_media_id": _obj(s, f"{prefix}_upscale_media_id"),
             "image_status": _obj(s, f"{prefix}_image_status"),
             "video_status": _obj(s, f"{prefix}_video_status"),
             "upscale_status": _obj(s, f"{prefix}_upscale_status"),
@@ -996,6 +1139,302 @@ async def workflow_status(
         "scenes": [scene_status_row(s) for s in scenes],
         "suggested_next_action": next_action,
     }
+
+
+async def _build_statusline_payload(
+    *,
+    project_id: str,
+    video_id: Optional[str] = None,
+) -> StatuslineResponse:
+    status = await _build_workflow_status_payload(project_id=project_id, video_id=video_id)
+    if status.get("videos") == []:
+        ext = await get_flow_client().get_extension_status()
+        controller = get_worker_controller()
+        slots = max(0, MAX_CONCURRENT_REQUESTS - controller.active_count)
+        line = (
+            f"GLA: {'✓ext' if ext.get('runtime_connected') else '×ext'} "
+            f"{(status.get('project') or {}).get('name') or 'project'} no-video "
+            f"slots:{controller.active_count}/{MAX_CONCURRENT_REQUESTS}"
+        )
+        return StatuslineResponse(
+            line=line,
+            project_id=project_id,
+            extension_connected=bool(ext.get("runtime_connected")),
+            worker_active=controller.active_count,
+            worker_slots=slots,
+            counts={},
+            queue={},
+            suggested_next_action="create_video",
+        )
+
+    counts = status.get("counts", {})
+    queue = status.get("queue", {})
+    project = status.get("project", {})
+    video = status.get("video", {})
+    controller = get_worker_controller()
+    slots = max(0, MAX_CONCURRENT_REQUESTS - controller.active_count)
+    ext = await get_flow_client().get_extension_status()
+    ext_ok = bool(ext.get("runtime_connected"))
+    line = (
+        f"GLA: {'✓ext' if ext_ok else '×ext'} "
+        f"{str(project.get('name') or 'project').strip()} "
+        f"{int(counts.get('images_total') or 0)}sc "
+        f"img:{int(counts.get('images_done') or 0)}/{int(counts.get('images_total') or 0)} "
+        f"vid:{int(counts.get('videos_done') or 0)}/{int(counts.get('videos_total') or 0)} "
+        f"4k:{int(counts.get('upscales_done') or 0)}/{int(counts.get('upscales_total') or 0)} "
+        f"q:{int(queue.get('pending') or 0)}/{int(queue.get('processing') or 0)}/{int(queue.get('failed') or 0)} "
+        f"slots:{controller.active_count}/{MAX_CONCURRENT_REQUESTS} "
+        f"next:{status.get('suggested_next_action') or '-'} "
+        f"{str(video.get('orientation') or '').lower()}"
+    )
+    return StatuslineResponse(
+        line=line,
+        project_id=project_id,
+        video_id=str(video.get("id") or "") or None,
+        extension_connected=ext_ok,
+        worker_active=controller.active_count,
+        worker_slots=slots,
+        counts={k: int(v or 0) for k, v in counts.items()},
+        queue={k: int(v or 0) for k, v in queue.items()},
+        suggested_next_action=status.get("suggested_next_action"),
+    )
+
+
+def _monitor_stage_progress_messages(
+    *,
+    prev: Optional[dict[str, int]],
+    curr: dict[str, int],
+    milestone_step: int,
+) -> list[str]:
+    messages: list[str] = []
+    stages = (
+        ("refs", "Ref"),
+        ("images", "Ảnh"),
+        ("videos", "Video"),
+        ("upscales", "Upscale 4K"),
+        ("downloads", "Tải 4K"),
+        ("tts", "TTS"),
+    )
+    for key, label in stages:
+        done_key = f"{key}_done"
+        total_key = f"{key}_total"
+        done = int(curr.get(done_key, 0))
+        total = int(curr.get(total_key, 0))
+        if total <= 0:
+            continue
+        prev_done = int((prev or {}).get(done_key, 0))
+        if done == total and prev_done < total:
+            messages.append(f"✅ {label} hoàn tất {done}/{total}")
+            continue
+        if done <= prev_done:
+            continue
+        prev_bucket = (prev_done // milestone_step) * milestone_step
+        done_bucket = (done // milestone_step) * milestone_step
+        if done_bucket > prev_bucket and done < total:
+            messages.append(f"🔄 {label}: {done}/{total}")
+    return messages
+
+
+async def _monitor_send_telegram(job: _MonitorJob, text: str):
+    if not job.telegram_enabled:
+        return
+    if not job.telegram_bot_token or not job.telegram_chat_id:
+        return
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            url = f"https://api.telegram.org/bot{job.telegram_bot_token}/sendMessage"
+            payload = {"chat_id": job.telegram_chat_id, "text": text}
+            async with session.post(url, json=payload):
+                pass
+    except Exception as e:
+        logger.warning("Monitor telegram send failed: %s", e)
+
+
+def _is_monitor_core_done(snapshot: dict[str, int]) -> bool:
+    required = ("refs", "images", "videos")
+    for key in required:
+        done = int(snapshot.get(f"{key}_done", 0))
+        total = int(snapshot.get(f"{key}_total", 0))
+        if total > 0 and done < total:
+            return False
+    return True
+
+
+async def _run_monitor_loop(job: _MonitorJob):
+    job.append_log("Monitor đã khởi động")
+    await _monitor_send_telegram(job, f"[FlowKit] Monitor started · {job.project_id}")
+    prev_snapshot: Optional[dict[str, int]] = None
+    while not job._stop_event.is_set():
+        job.cycle += 1
+        job.last_tick_at = datetime.now(timezone.utc)
+        try:
+            status = await _build_workflow_status_payload(project_id=job.project_id, video_id=job.video_id)
+            if status.get("video"):
+                job.video_id = str((status.get("video") or {}).get("id") or job.video_id or "")
+                job.orientation = normalize_orientation(
+                    str((status.get("video") or {}).get("orientation") or job.orientation)
+                )
+            counts = {k: int(v or 0) for k, v in (status.get("counts") or {}).items()}
+            queue = {k: int(v or 0) for k, v in (status.get("queue") or {}).items()}
+            snapshot = {**counts, **{f"queue_{k}": v for k, v in queue.items()}}
+            if snapshot != prev_snapshot:
+                job.last_change_at = datetime.now(timezone.utc)
+            job.latest_snapshot = snapshot
+            statusline = await _build_statusline_payload(project_id=job.project_id, video_id=job.video_id)
+            job.latest_statusline = statusline.line
+            job.latest_error = None
+
+            notify_lines = _monitor_stage_progress_messages(
+                prev=prev_snapshot,
+                curr=counts,
+                milestone_step=job.milestone_step,
+            )
+            prev_failed = int((prev_snapshot or {}).get("queue_failed", 0))
+            curr_failed = int(snapshot.get("queue_failed", 0))
+            if curr_failed > prev_failed:
+                notify_lines.append(
+                    f"❌ Có thêm {curr_failed - prev_failed} lỗi mới (tổng lỗi hàng đợi: {curr_failed})"
+                )
+
+            if job.auto_download_upscales and job.video_id:
+                up_done = int(counts.get("upscales_done", 0))
+                dl_done = int(counts.get("downloads_done", 0))
+                if up_done > dl_done:
+                    dl = await download_upscales(
+                        job.video_id,
+                        DownloadUpscalesRequest(
+                            project_id=job.project_id,
+                            orientation=job.orientation,
+                            overwrite=False,
+                        ),
+                    )
+                    if dl.downloaded:
+                        notify_lines.append(f"📥 Tải 4K mới: +{len(dl.downloaded)} clip")
+
+            if job.summary_every_cycles > 0 and job.cycle % job.summary_every_cycles == 0:
+                notify_lines.append(
+                    "📊 Tóm tắt: "
+                    f"ref {int(counts.get('refs_done', 0))}/{int(counts.get('refs_total', 0))} · "
+                    f"img {int(counts.get('images_done', 0))}/{int(counts.get('images_total', 0))} · "
+                    f"vid {int(counts.get('videos_done', 0))}/{int(counts.get('videos_total', 0))} · "
+                    f"4k {int(counts.get('upscales_done', 0))}/{int(counts.get('upscales_total', 0))} · "
+                    f"q {int(queue.get('pending', 0))}/{int(queue.get('processing', 0))}/{int(queue.get('failed', 0))}"
+                )
+
+            for line in notify_lines:
+                job.append_log(line)
+                await _monitor_send_telegram(job, f"[FlowKit] {line}")
+
+            prev_snapshot = snapshot
+
+            if job.stop_when_done and _is_monitor_core_done(counts):
+                job.append_log("Đã hoàn tất các bước lõi (ref/image/video) — tự dừng monitor")
+                await _monitor_send_telegram(job, "[FlowKit] Monitor auto-stopped: core pipeline complete.")
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            job.latest_error = msg
+            job.append_log(f"Lỗi monitor: {msg}")
+
+        try:
+            await asyncio.wait_for(job._stop_event.wait(), timeout=job.interval_sec)
+        except asyncio.TimeoutError:
+            pass
+
+    job.running = False
+    job.append_log("Monitor đã dừng")
+
+
+@router.get("/statusline", response_model=StatuslineResponse)
+async def workflow_statusline(
+    project_id: Optional[str] = Query(None),
+    video_id: Optional[str] = Query(None),
+):
+    if not project_id:
+        listed = await _list_project_status_summaries()
+        first = (listed.get("projects") or [{}])[0]
+        project_id = str(first.get("id") or "").strip()
+        if not project_id:
+            return StatuslineResponse(
+                line="GLA: ×ext no-project",
+                extension_connected=False,
+                worker_active=0,
+                worker_slots=MAX_CONCURRENT_REQUESTS,
+                suggested_next_action="create_project",
+            )
+    return await _build_statusline_payload(project_id=project_id, video_id=video_id)
+
+
+@router.post("/monitor/start", response_model=MonitorStateResponse)
+async def monitor_start(body: MonitorStartRequest):
+    project = await _repo.get_project(body.project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    key = _monitor_key(body.project_id, body.video_id)
+    existing = _MONITOR_JOBS.get(key)
+    if existing and existing.running:
+        return existing.to_payload()
+    if existing:
+        await existing.stop()
+        _MONITOR_JOBS.pop(key, None)
+
+    job = _MonitorJob(body)
+    _MONITOR_JOBS[key] = job
+    job._task = asyncio.create_task(_run_monitor_loop(job))
+    return job.to_payload()
+
+
+@router.post("/monitor/stop", response_model=MonitorStateResponse)
+async def monitor_stop(body: MonitorStopRequest):
+    job: Optional[_MonitorJob] = None
+    if body.video_id:
+        key = _monitor_key(body.project_id, body.video_id)
+        job = _MONITOR_JOBS.get(key)
+    else:
+        for candidate in _MONITOR_JOBS.values():
+            if candidate.project_id == body.project_id and candidate.running:
+                job = candidate
+                break
+    if not job:
+        raise HTTPException(404, "Monitor not found for this project/video")
+    await job.stop()
+    return job.to_payload()
+
+
+@router.get("/monitor/state", response_model=MonitorStateListResponse)
+async def monitor_state(
+    project_id: Optional[str] = Query(None),
+    video_id: Optional[str] = Query(None),
+):
+    rows: list[MonitorStateResponse] = []
+    if project_id:
+        if video_id:
+            key = _monitor_key(project_id, video_id)
+            job = _MONITOR_JOBS.get(key)
+            if job:
+                rows.append(job.to_payload())
+        else:
+            for candidate in _MONITOR_JOBS.values():
+                if candidate.project_id == project_id:
+                    rows.append(candidate.to_payload())
+    else:
+        for job in _MONITOR_JOBS.values():
+            rows.append(job.to_payload())
+    rows = sorted(rows, key=lambda r: r.started_at, reverse=True)
+    return MonitorStateListResponse(monitors=rows, active_count=sum(1 for row in rows if row.running))
+
+
+@router.get("/status")
+async def workflow_status(
+    project_id: Optional[str] = Query(None),
+    video_id: Optional[str] = Query(None),
+):
+    """Aggregated status dashboard (fk:status + fk:monitor parity)."""
+    if not project_id:
+        return await _list_project_status_summaries()
+    return await _build_workflow_status_payload(project_id=project_id, video_id=video_id)
 
 
 @router.post("/videos/{video_id}/text-overlays", response_model=GenerateTextOverlaysResponse)
@@ -1482,8 +1921,7 @@ async def smart_continue(video_id: str, body: SmartContinueRequest):
             key=lambda sr: sr.overall_score,
         )
         if failed_reviews:
-            queued = 0
-            req_types: list[str] = []
+            manual_regen_scenes: list[dict[str, Any]] = []
             reviewed_scene_by_id = {str(_obj(s, "id")): s for s in scenes}
             for sr in failed_reviews[: body.max_review_regens]:
                 scene_id = str(sr.scene_id)
@@ -1504,33 +1942,38 @@ async def smart_continue(video_id: str, body: SmartContinueRequest):
                     if sr.overall_score < body.low_score_regen_image_threshold or bool(getattr(sr, "has_critical_errors", False))
                     else "REGENERATE_VIDEO"
                 )
-                if await _enqueue_request_if_needed(
-                    req_type=req_type,
-                    project_id=project_id,
-                    video_id=video_id,
-                    scene_id=scene_id,
-                    orientation=orientation,
-                ):
-                    queued += 1
-                    req_types.append(req_type)
+                manual_regen_scenes.append(
+                    {
+                        "scene_id": scene_id,
+                        "display_order": int(_obj(scene, "display_order", 0)) + 1,
+                        "overall_score": float(sr.overall_score),
+                        "has_critical_errors": bool(getattr(sr, "has_critical_errors", False)),
+                        "suggested_request_type": req_type,
+                        "fix_guide": fix,
+                    }
+                )
 
             return SmartContinueResponse(
                 project_id=project_id,
                 video_id=video_id,
                 orientation=orientation,
-                action="review_regen",
+                action="review_manual",
                 message=(
                     f"Review found {len(failed_reviews)} scene(s) below {body.review_threshold:.1f}. "
-                    f"Queued {queued} regen request(s)."
+                    "Auto-regenerate hàng loạt đã bị khóa để tránh ghi đè nhầm. "
+                    "Hãy tạo lại thủ công từng scene theo gợi ý."
                 ),
-                queued_requests=queued,
-                requested_types=sorted(set(req_types)),
+                queued_requests=0,
+                requested_types=[],
                 review={
                     "mode": body.review_mode,
                     "threshold": body.review_threshold,
                     "overall_score": review.overall_score,
                     "failed_count": len(failed_reviews),
                     "failed_scene_ids": [str(r.scene_id) for r in failed_reviews],
+                    "manual_regen_scenes": manual_regen_scenes,
+                    "manual_policy": "manual_only",
+                    "auto_queue_disabled": True,
                 },
             )
 

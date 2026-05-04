@@ -95,6 +95,10 @@ export default function ReviewVideoModal({ videoId, projectId, onClose }: Props)
     }
 
     const regenScene = async (sr: SceneReview) => {
+        const ok = window.confirm(
+            `Tạo lại video cho scene …${sr.scene_id.slice(-8)}? Thao tác này có thể ghi đè video hiện tại của scene này.`,
+        )
+        if (!ok) return
         setRegenning(prev => new Set([...prev, sr.scene_id]))
         try {
             if (sr.fix_guide) {
@@ -117,12 +121,6 @@ export default function ReviewVideoModal({ videoId, projectId, onClose }: Props)
         } finally {
             setRegenning(prev => { const n = new Set(prev); n.delete(sr.scene_id); return n })
         }
-    }
-
-    const regenAllFailed = async () => {
-        if (!result) return
-        const failed = result.scene_reviews.filter(s => s.overall_score < 7.5)
-        for (const s of failed) await regenScene(s)
     }
 
     const failed = result?.scene_reviews.filter(s => s.overall_score < 7.5) ?? []
@@ -181,9 +179,10 @@ export default function ReviewVideoModal({ videoId, projectId, onClose }: Props)
                             </div>
                             <ScoreBar score={result.overall_score} />
                             {failed.length > 0 && (
-                                <ActionButton variant="danger" size="sm" onClick={regenAllFailed}>
-                                    <RefreshCw size={11} /> Regen All Failed ({failed.length} scenes)
-                                </ActionButton>
+                                <div className="text-[11px] rounded-md px-2 py-1 border"
+                                    style={{ color: 'var(--amber-700, #b45309)', background: 'rgba(245,158,11,0.1)', borderColor: 'rgba(245,158,11,0.3)' }}>
+                                    Đã khóa tạo lại hàng loạt. Hãy dùng nút <b>Regen</b> từng scene bên dưới để tránh ghi đè nhầm.
+                                </div>
                             )}
                         </div>
 

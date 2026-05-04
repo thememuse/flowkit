@@ -213,7 +213,24 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
   projectId: string; orientation: string; characters: Character[]; onRefresh: () => void
 }) {
   type CharReqStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED'
-  type CharReqState = { status: CharReqStatus; error?: string | null; retryCount?: number }
+  type CharReqState = { status: CharReqStatus; error?: string | null; retryCount?: number; nextRetryAt?: string | null }
+
+  const isRetryWaitingError = (message?: string | null): boolean => {
+    const text = String(message || '').toLowerCase()
+    if (!text) return false
+    return (
+      text.includes('traffic cooldown')
+      || text.includes('google_sorry_page')
+      || text.includes('unusual traffic')
+      || text.includes('captcha')
+      || text.includes('recaptcha')
+      || text.includes('retry')
+      || text.includes('token expired')
+      || text.includes('flow_tab_not_ready')
+      || text.includes('no_flow_tab')
+      || text.includes('extension not connected')
+    )
+  }
 
   const [showAdd, setShowAdd] = useState(false)
   const [uploadingCharacterId, setUploadingCharacterId] = useState<string | null>(null)
@@ -222,10 +239,14 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
   const [charReqState, setCharReqState] = useState<Record<string, CharReqState>>({})
   const [refBatch, setRefBatch] = useState<{
     pending: number
+    queued_pending?: number
+    retry_waiting?: number
     processing: number
     completed: number
     failed: number
     total: number
+    next_retry_at?: string | null
+    next_retry_in_sec?: number | null
     status_hint?: string | null
   } | null>(null)
   const previewResolving = useRef<Set<string>>(new Set())
@@ -235,10 +256,15 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
   const normalizedOrientation = normalizeOrientation(orientation)
   const busyCharacterIds = new Set(
     Object.entries(charReqState)
-      .filter(([, s]) => s.status === 'PENDING' || s.status === 'PROCESSING')
+      .filter(([, s]) =>
+        s.status === 'PROCESSING'
+        || (s.status === 'PENDING' && !isRetryWaitingError(s.error))
+      )
       .map(([cid]) => cid),
   )
-  const activeRefCount = (refBatch?.pending ?? 0) + (refBatch?.processing ?? 0)
+  const runningRefCount = (refBatch?.queued_pending ?? 0) + (refBatch?.processing ?? 0)
+  const retryWaitingRefCount = refBatch?.retry_waiting ?? 0
+  const activeRefCount = runningRefCount + retryWaitingRefCount
 
   const ensureFlowTabReadyForMedia = useCallback(async () => {
     const hasFlowTab = async () => {
@@ -281,7 +307,18 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
   const loadRefRequestState = useCallback(async () => {
     try {
       const [summary, allRequests] = await Promise.all([
-        fetchAPI<{ pending: number; processing: number; completed: number; failed: number; total: number; status_hint?: string | null }>(
+        fetchAPI<{
+          pending: number
+          queued_pending?: number
+          retry_waiting?: number
+          processing: number
+          completed: number
+          failed: number
+          total: number
+          next_retry_at?: string | null
+          next_retry_in_sec?: number | null
+          status_hint?: string | null
+        }>(
           `/api/requests/batch-status?project_id=${projectId}&type=GENERATE_CHARACTER_IMAGE`,
         ),
         fetchAPI<Array<{
@@ -291,6 +328,7 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
           status: CharReqStatus
           error_message: string | null
           retry_count: number
+          next_retry_at?: string | null
           updated_at?: string | null
           created_at?: string | null
         }>>(`/api/requests?project_id=${projectId}`),
@@ -315,6 +353,7 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
           status: row.status,
           error: row.error_message,
           retryCount: row.retry_count,
+          nextRetryAt: row.next_retry_at ?? null,
         }
       }
       setCharReqState(byChar)
@@ -462,9 +501,10 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
 
   useEffect(() => {
     void loadRefRequestState()
-    const timer = setInterval(() => { void loadRefRequestState() }, activeRefCount > 0 ? 1500 : 3500)
+    const intervalMs = runningRefCount > 0 ? 1500 : (retryWaitingRefCount > 0 ? 4000 : 3500)
+    const timer = setInterval(() => { void loadRefRequestState() }, intervalMs)
     return () => clearInterval(timer)
-  }, [loadRefRequestState, activeRefCount])
+  }, [loadRefRequestState, runningRefCount, retryWaitingRefCount])
 
   useEffect(() => {
     previewRefreshFailedAt.current.clear()
@@ -509,7 +549,9 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
         <span className="text-xs text-[hsl(var(--muted-foreground))]">{characters.length} thực thể</span>
         {activeRefCount > 0 && (
           <Badge variant="warning" className="text-[10px]">
-            Ref đang chạy: {(refBatch?.processing ?? 0)} xử lý • {(refBatch?.pending ?? 0)} chờ
+            {runningRefCount > 0
+              ? `Ref đang chạy: ${(refBatch?.processing ?? 0)} xử lý • ${(refBatch?.queued_pending ?? 0)} chờ`
+              : `Ref đang chờ retry: ${retryWaitingRefCount}`}
           </Badge>
         )}
         {(refBatch?.failed ?? 0) > 0 && (
@@ -517,11 +559,14 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
             Ref lỗi: {refBatch?.failed}
           </Badge>
         )}
+        {!!refBatch?.status_hint && (
+          <span className="text-[10px] text-amber-600">{refBatch.status_hint}</span>
+        )}
         <div className="flex-1" />
         {characters.length > 0 && (
-          <Button variant="outline" size="sm" onClick={genRefs} disabled={activeRefCount > 0}>
-            <RefreshCw size={11} className={activeRefCount > 0 ? 'animate-spin' : ''} />
-            {activeRefCount > 0 ? 'Đang tạo ref...' : 'Tạo ảnh TN'}
+          <Button variant="outline" size="sm" onClick={genRefs} disabled={runningRefCount > 0}>
+            <RefreshCw size={11} className={runningRefCount > 0 ? 'animate-spin' : ''} />
+            {runningRefCount > 0 ? 'Đang tạo ref...' : (retryWaitingRefCount > 0 ? 'Tiếp tục tạo ref' : 'Tạo ảnh TN')}
           </Button>
         )}
         <Button size="sm" onClick={() => setShowAdd(true)}>
@@ -591,9 +636,19 @@ function CharactersTab({ projectId, orientation, characters, onRefresh }: {
                             </span>
                           </div>
                           {req && (req.status === 'PENDING' || req.status === 'PROCESSING' || req.status === 'FAILED') && (
-                            <div className={cn('text-[10px]', req.status === 'FAILED' ? 'text-red-600' : 'text-amber-600')}>
+                            <div className={cn('text-[10px]',
+                              req.status === 'FAILED'
+                                ? 'text-red-600'
+                                : (req.status === 'PENDING' && isRetryWaitingError(req.error))
+                                  ? 'text-orange-600'
+                                  : 'text-amber-600')}
+                            >
                               {req.status === 'PROCESSING' && 'Đang tạo ảnh ref...'}
-                              {req.status === 'PENDING' && 'Đang xếp hàng tạo ảnh ref...'}
+                              {req.status === 'PENDING' && (
+                                isRetryWaitingError(req.error)
+                                  ? `Đang chờ retry${req.nextRetryAt ? ` (${new Date(req.nextRetryAt).toLocaleTimeString('vi-VN')})` : ''}`
+                                  : 'Đang xếp hàng tạo ảnh ref...'
+                              )}
                               {req.status === 'FAILED' && `Ref lỗi: ${req.error || 'Lỗi không xác định'}`}
                             </div>
                           )}
@@ -807,6 +862,10 @@ function ScenesTab({ projectId, videos, defaultOrientation }: { projectId: strin
   }
 
   const regenImage = async (sceneId: string) => {
+    const ok = window.confirm(
+      'Tạo lại ảnh cho scene này? Thao tác này có thể ghi đè ảnh hiện tại.',
+    )
+    if (!ok) return
     await fetchAPI('/api/requests/batch', {
       method: 'POST',
       body: JSON.stringify({ requests: [{ type: 'REGENERATE_IMAGE', project_id: projectId, video_id: selectedVideoId, scene_id: sceneId, orientation: currentOrientation }] }),
@@ -814,6 +873,10 @@ function ScenesTab({ projectId, videos, defaultOrientation }: { projectId: strin
   }
 
   const regenVideo = async (sceneId: string) => {
+    const ok = window.confirm(
+      'Tạo lại video cho scene này? Thao tác này có thể ghi đè video hiện tại.',
+    )
+    if (!ok) return
     await fetchAPI('/api/requests/batch', {
       method: 'POST',
       body: JSON.stringify({ requests: [{ type: 'REGENERATE_VIDEO', project_id: projectId, video_id: selectedVideoId, scene_id: sceneId, orientation: currentOrientation }] }),

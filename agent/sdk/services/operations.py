@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import ssl
+import time
 from typing import TYPE_CHECKING, Optional, Awaitable, Callable
 
 
@@ -241,6 +242,8 @@ logger = logging.getLogger(__name__)
 
 # Entity types that need landscape (wide) reference images
 _LANDSCAPE_ENTITY_TYPES = {"location"}
+_SUBMIT_PENDING_UNTIL_PREFIX = "submit_pending_until:"
+_SUBMIT_PENDING_FALLBACK_SEC = 35
 
 
 def _reference_aspect_ratio(entity_type: str) -> str:
@@ -275,14 +278,174 @@ def _save_raw_bytes(
 
 
 def _extract_operations(result: dict) -> list[dict]:
-    """Extract operations list from video gen / upscale submit response."""
+    """Extract operations list from video gen / upscale submit response.
+
+    Handles nested payload variants, e.g.:
+    - {"data": {"operations": [...]}}
+    - {"result": {"operations": [...]}}
+    - deeply nested {"...": {"operation": {"name": ...}}}
+    """
+    if not isinstance(result, dict):
+        return []
     data = result.get("data", result)
-    ops = data.get("operations", [])
-    for op in ops:
-        op_name = op.get("operation", {}).get("name")
-        if not op_name:
-            logger.warning("Operation missing name: %s", op)
-    return ops
+    search_roots: list[object] = [data, result]
+    visited: set[int] = set()
+    queue: list[object] = search_roots[:]
+
+    def _looks_like_ops(value: object) -> bool:
+        if not isinstance(value, list) or not value:
+            return False
+        sample = value[0]
+        return isinstance(sample, dict) and (
+            "operation" in sample
+            or "status" in sample
+            or "rawBytes" in sample
+            or "mediaGenerationId" in sample
+        )
+
+    while queue:
+        node = queue.pop(0)
+        node_id = id(node)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+
+        if isinstance(node, dict):
+            ops = node.get("operations")
+            if _looks_like_ops(ops):
+                out_ops = list(ops)
+                for op in out_ops:
+                    op_name = op.get("operation", {}).get("name") if isinstance(op, dict) else None
+                    if not op_name:
+                        logger.warning("Operation missing name: %s", op)
+                return out_ops
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+
+    return []
+
+def _build_submit_pending_marker(delay_sec: int | float | None = None) -> str:
+    try:
+        delay = max(8, int(float(delay_sec))) if delay_sec is not None else _SUBMIT_PENDING_FALLBACK_SEC
+    except Exception:
+        delay = _SUBMIT_PENDING_FALLBACK_SEC
+    delay = min(delay, 180)
+    return f"{_SUBMIT_PENDING_UNTIL_PREFIX}{int(time.time()) + delay}"
+
+
+def _parse_submit_pending_marker(value: str | None) -> int | None:
+    text = str(value or "").strip().lower()
+    if not text.startswith(_SUBMIT_PENDING_UNTIL_PREFIX):
+        return None
+    raw = text.removeprefix(_SUBMIT_PENDING_UNTIL_PREFIX).strip()
+    try:
+        ts = int(raw)
+    except Exception:
+        return None
+    return ts if ts > 0 else None
+
+
+def _is_transient_video_submit_result(result: dict) -> bool:
+    """Whether video submit response should stay pending (avoid duplicate re-submit)."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("pending") is True:
+        return True
+
+    status_raw = result.get("status")
+    try:
+        status = int(status_raw) if status_raw is not None else 0
+    except Exception:
+        status = 0
+
+    text = _extract_error_text(result).strip().lower()
+    if status in (0, 408, 409, 423, 425, 429, 500, 502, 503, 504):
+        return True
+    if "traffic cooldown" in text or "cooldown_wait" in text:
+        return True
+    if "captcha" in text or "recaptcha" in text:
+        return True
+    if "google_sorry_page" in text or "unusual traffic" in text or "too_much_traffic" in text:
+        return True
+    if "flow_tab" in text or "no_flow_tab" in text or "pending verify" in text:
+        return True
+    if "token expired" in text:
+        return True
+
+    if status == 403:
+        transient_403_markers = (
+            "google_sorry_page",
+            "unusual traffic",
+            "too_much_traffic",
+            "captcha",
+            "recaptcha",
+            "flow_tab",
+            "no_flow_tab",
+            "token expired",
+            "pending verify",
+        )
+        if any(m in text for m in transient_403_markers):
+            return True
+
+    return False
+
+
+def _is_transient_status_check_error(result: dict) -> bool:
+    """Whether a check-status failure should stay pending (not hard-fail)."""
+    text = _extract_error_text(result).strip().lower()
+    status_raw = result.get("status")
+    try:
+        status = int(status_raw) if status_raw is not None else 0
+    except Exception:
+        status = 0
+
+    if status in (0, 408, 409, 423, 425, 429, 500, 502, 503, 504):
+        return True
+
+    if status == 403:
+        hard_fail_markers = (
+            "model_access_denied",
+            "public_error_model_access_denied",
+            "permission denied",
+            "insufficient permission",
+        )
+        if any(m in text for m in hard_fail_markers):
+            return False
+        transient_403_markers = (
+            "google_sorry_page",
+            "unusual traffic",
+            "too_much_traffic",
+            "captcha",
+            "recaptcha",
+            "flow_tab",
+            "no_flow_tab",
+            "token expired",
+            "pending verify",
+        )
+        if any(m in text for m in transient_403_markers):
+            return True
+
+    transient_markers = (
+        "timeout",
+        "failed to fetch",
+        "extension not connected",
+        "connection closed",
+        "ws closed",
+        "flow_tab_context_required",
+        "no_flow_tab",
+        "flow tab unavailable",
+        "network",
+        "temporary",
+    )
+    if any(m in text for m in transient_markers):
+        return True
+
+    return False
 
 
 async def _poll_operations(
@@ -361,7 +524,26 @@ async def _check_operations_once(
         return {"error": "No operations to check"}
 
     status_result = await client.check_video_status(operations)
+    if isinstance(status_result, dict) and status_result.get("pending") is True:
+        retry_raw = status_result.get("retry_after_sec", pending_retry_sec)
+        try:
+            retry_after_sec = max(3, int(float(retry_raw)))
+        except Exception:
+            retry_after_sec = pending_retry_sec
+        return {
+            "pending": True,
+            "retry_after_sec": retry_after_sec,
+            "message": str(status_result.get("message") or "Video status pending"),
+            "data": status_result.get("data"),
+        }
     if _is_error(status_result):
+        if _is_transient_status_check_error(status_result):
+            err_text = _extract_error_text(status_result) or "status check transient error"
+            return {
+                "pending": True,
+                "retry_after_sec": pending_retry_sec,
+                "message": f"Video status pending ({err_text})",
+            }
         return status_result
 
     data = status_result.get("data", status_result)
@@ -446,6 +628,7 @@ class OperationService:
                 aspect_ratio=aspect,
                 user_paygate_tier=tier,
                 character_media_ids=char_media_ids,
+                request_type="GENERATE_IMAGE",
             ),
         )
 
@@ -500,6 +683,7 @@ class OperationService:
                 aspect_ratio=aspect,
                 user_paygate_tier=tier,
                 character_media_ids=char_media_ids,
+                request_type="EDIT_IMAGE",
             ),
         )
 
@@ -536,6 +720,20 @@ class OperationService:
 
         queue_mode = bool(request_id)
 
+        pending_until = _parse_submit_pending_marker(existing_op)
+        if pending_until is not None:
+            now_ts = int(time.time())
+            if now_ts < pending_until:
+                return {
+                    "pending": True,
+                    "retry_after_sec": max(8, VIDEO_POLL_INTERVAL),
+                    "message": f"Video submit pending verification ({pending_until - now_ts}s)",
+                }
+            # Pending gate expired: allow one re-submit attempt.
+            if request_id:
+                await crud.update_request(request_id, request_id=None)
+            existing_op = None
+
         if existing_op:
             logger.info("Video gen already submitted (op=%s), re-polling", existing_op[:30])
             operations = [{"operation": {"name": existing_op}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
@@ -551,16 +749,61 @@ class OperationService:
             aspect_ratio=aspect,
             end_image_media_id=end_id,
             user_paygate_tier=tier,
+            request_key=request_id,
         )
 
+        submit_ops = _extract_operations(submit_result) if isinstance(submit_result, dict) else []
+        submit_op_name = ""
+        if submit_ops:
+            submit_op_name = str(submit_ops[0].get("operation", {}).get("name", "") or "")
+            if request_id and submit_op_name:
+                await crud.update_request(request_id, request_id=submit_op_name)
+
+        if isinstance(submit_result, dict) and submit_result.get("pending") is True:
+            retry_raw = submit_result.get("retry_after_sec", VIDEO_POLL_INTERVAL)
+            try:
+                retry_after_sec = max(6, int(float(retry_raw)))
+            except Exception:
+                retry_after_sec = max(8, VIDEO_POLL_INTERVAL)
+            if request_id and (not submit_op_name):
+                await crud.update_request(request_id, request_id=_build_submit_pending_marker(retry_after_sec + 8))
+            return {
+                "pending": True,
+                "retry_after_sec": retry_after_sec,
+                "message": str(submit_result.get("message") or "Video submit pending"),
+                "data": submit_result.get("data"),
+            }
+
         if _is_error(submit_result):
+            if submit_op_name:
+                return {
+                    "pending": True,
+                    "retry_after_sec": max(8, VIDEO_POLL_INTERVAL),
+                    "message": "Video submitted (op captured) despite transient response. Waiting for completion.",
+                    "data": {"operations": submit_ops},
+                }
+            if queue_mode and _is_transient_video_submit_result(submit_result):
+                retry_after_sec = max(8, VIDEO_POLL_INTERVAL)
+                if isinstance(submit_result, dict) and submit_result.get("retry_after_sec") is not None:
+                    try:
+                        retry_after_sec = max(8, int(float(submit_result.get("retry_after_sec"))))
+                    except Exception:
+                        retry_after_sec = max(8, VIDEO_POLL_INTERVAL)
+                if request_id:
+                    await crud.update_request(request_id, request_id=_build_submit_pending_marker(retry_after_sec + 8))
+                return {
+                    "pending": True,
+                    "retry_after_sec": retry_after_sec,
+                    "message": str(_extract_error_text(submit_result) or "Video submit pending"),
+                    "data": submit_result.get("data") if isinstance(submit_result, dict) else None,
+                }
             return submit_result
 
-        operations = _extract_operations(submit_result)
+        operations = submit_ops
         if not operations:
             return {"error": "Video gen returned no operations"}
 
-        op_name = operations[0].get("operation", {}).get("name", "")
+        op_name = submit_op_name or operations[0].get("operation", {}).get("name", "")
         if request_id:
             await crud.update_request(request_id, request_id=op_name)
 
@@ -660,6 +903,19 @@ class OperationService:
 
         queue_mode = bool(request_id)
 
+        pending_until = _parse_submit_pending_marker(existing_op)
+        if pending_until is not None:
+            now_ts = int(time.time())
+            if now_ts < pending_until:
+                return {
+                    "pending": True,
+                    "retry_after_sec": max(8, VIDEO_POLL_INTERVAL),
+                    "message": f"R2V submit pending verification ({pending_until - now_ts}s)",
+                }
+            if request_id:
+                await crud.update_request(request_id, request_id=None)
+            existing_op = None
+
         if existing_op:
             logger.info("R2V already submitted (op=%s), re-polling", existing_op[:30])
             operations = [{"operation": {"name": existing_op}, "status": "MEDIA_GENERATION_STATUS_PENDING"}]
@@ -674,16 +930,61 @@ class OperationService:
             scene_id=scene.get("id", ""),
             aspect_ratio=aspect,
             user_paygate_tier=tier,
+            request_key=request_id,
         )
 
+        submit_ops = _extract_operations(submit_result) if isinstance(submit_result, dict) else []
+        submit_op_name = ""
+        if submit_ops:
+            submit_op_name = str(submit_ops[0].get("operation", {}).get("name", "") or "")
+            if request_id and submit_op_name:
+                await crud.update_request(request_id, request_id=submit_op_name)
+
+        if isinstance(submit_result, dict) and submit_result.get("pending") is True:
+            retry_raw = submit_result.get("retry_after_sec", VIDEO_POLL_INTERVAL)
+            try:
+                retry_after_sec = max(6, int(float(retry_raw)))
+            except Exception:
+                retry_after_sec = max(8, VIDEO_POLL_INTERVAL)
+            if request_id and (not submit_op_name):
+                await crud.update_request(request_id, request_id=_build_submit_pending_marker(retry_after_sec + 8))
+            return {
+                "pending": True,
+                "retry_after_sec": retry_after_sec,
+                "message": str(submit_result.get("message") or "R2V submit pending"),
+                "data": submit_result.get("data"),
+            }
+
         if _is_error(submit_result):
+            if submit_op_name:
+                return {
+                    "pending": True,
+                    "retry_after_sec": max(8, VIDEO_POLL_INTERVAL),
+                    "message": "R2V submitted (op captured) despite transient response. Waiting for completion.",
+                    "data": {"operations": submit_ops},
+                }
+            if queue_mode and _is_transient_video_submit_result(submit_result):
+                retry_after_sec = max(8, VIDEO_POLL_INTERVAL)
+                if isinstance(submit_result, dict) and submit_result.get("retry_after_sec") is not None:
+                    try:
+                        retry_after_sec = max(8, int(float(submit_result.get("retry_after_sec"))))
+                    except Exception:
+                        retry_after_sec = max(8, VIDEO_POLL_INTERVAL)
+                if request_id:
+                    await crud.update_request(request_id, request_id=_build_submit_pending_marker(retry_after_sec + 8))
+                return {
+                    "pending": True,
+                    "retry_after_sec": retry_after_sec,
+                    "message": str(_extract_error_text(submit_result) or "R2V submit pending"),
+                    "data": submit_result.get("data") if isinstance(submit_result, dict) else None,
+                }
             return submit_result
 
-        operations = _extract_operations(submit_result)
+        operations = submit_ops
         if not operations:
             return {"error": "R2V returned no operations"}
 
-        op_name = operations[0].get("operation", {}).get("name", "")
+        op_name = submit_op_name or operations[0].get("operation", {}).get("name", "")
         if request_id:
             await crud.update_request(request_id, request_id=op_name)
 
@@ -857,6 +1158,7 @@ class OperationService:
                 project_id=pid,
                 aspect_ratio=aspect,
                 user_paygate_tier=tier,
+                request_type="GENERATE_CHARACTER_IMAGE",
             ),
         )
 
@@ -1099,7 +1401,11 @@ async def _upload_character_image(client: FlowClient, char: dict, project_id: st
 
         encoded = base64.b64encode(image_bytes).decode("utf-8")
         result = await client.upload_image(
-            encoded, mime_type=mime, project_id=project_id, file_name=file_name,
+            encoded,
+            mime_type=mime,
+            project_id=project_id,
+            file_name=file_name,
+            request_type="GENERATE_CHARACTER_IMAGE",
         )
 
         if result.get("_mediaId"):

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from agent.models.request import Request, RequestCreate
 from agent.models.enums import StatusType
 from agent.db import crud
@@ -29,6 +29,47 @@ _STAGE_BY_TYPE: dict[str, str] = {
     "UPSCALE_VIDEO": "scene_upscale",
     "UPSCALE_VIDEO_LOCAL": "scene_upscale",
 }
+
+_CAPTCHA_TYPES: set[str] = {
+    "GENERATE_CHARACTER_IMAGE",
+    "REGENERATE_CHARACTER_IMAGE",
+    "EDIT_CHARACTER_IMAGE",
+    "GENERATE_IMAGE",
+    "REGENERATE_IMAGE",
+    "EDIT_IMAGE",
+    "GENERATE_VIDEO",
+    "REGENERATE_VIDEO",
+    "GENERATE_VIDEO_REFS",
+}
+
+
+def _stage_of(req_type: str | None) -> str:
+    return _STAGE_BY_TYPE.get(str(req_type or ""), str(req_type or ""))
+
+
+def _matches_logical_request(
+    row: dict,
+    *,
+    req_type: str,
+    scene_id: str | None,
+    character_id: str | None,
+    orientation: str | None,
+) -> bool:
+    """Compare by logical stage (not raw type) to avoid GENERATE/REGENERATE duplicates."""
+    if _stage_of(row.get("type")) != _stage_of(req_type):
+        return False
+
+    if scene_id:
+        if row.get("scene_id") != scene_id:
+            return False
+        req_orient = normalize_orientation(orientation) if orientation else "NONE"
+        row_orient = normalize_orientation(row.get("orientation")) if row.get("orientation") else "NONE"
+        return req_orient == row_orient
+
+    if character_id:
+        return row.get("character_id") == character_id
+
+    return False
 
 
 def _expand_types(type_filter: str | None) -> set[str] | None:
@@ -97,6 +138,25 @@ def _status_hint(error_message: str | None) -> str | None:
         return "Captcha failed: đang chờ retry."
     if "extension not connected" in em or "extension disconnected" in em:
         return "Extension mất kết nối."
+    if "google_sorry_page" in em or "unusual traffic" in em:
+        return "Google chặn tạm thời do traffic bất thường. Hệ thống đã chuyển sang retry chậm để giảm captcha."
+    if "model_access_denied" in em:
+        return "Tài khoản hiện tại không có quyền dùng model này. Hãy đổi model hoặc đổi account/tier."
+    if "quota_reached" in em or "public_error_user_quota_reached" in em or "public_error_per_model_daily_quota_reached" in em:
+        return "Tài khoản đã chạm quota của Google Flow. Chờ reset quota hoặc đổi account rồi thử lại."
+    if "api_403" in em:
+        return "Google Flow từ chối request (API_403). Hệ thống sẽ retry ngắn để tự phục hồi phiên; nếu còn lỗi, kiểm tra quyền model/quota/account."
+    if "api_429" in em:
+        return "Google Flow trả API_429 (quá nhiều request hoặc hết quota tạm thời). Hãy chờ rồi thử lại."
+    if "api_500" in em:
+        return "Google Flow đang lỗi nội bộ (API_500). Hệ thống sẽ tự retry."
+    if (
+        "api_401" in em
+        or "http_401" in em
+        or "invalid authentication credentials" in em
+        or "missing required authentication credential" in em
+    ):
+        return "Token Google Flow đã hết hạn/không hợp lệ. Hệ thống đang tự làm mới token và sẽ retry."
     if "local_upscale_setup_required" in em:
         return "Thiếu công cụ upscale local (ffmpeg/ffprobe/realesrgan/model). Cần cấu hình trước khi chạy 4K local."
     if "no local source video available for local upscale" in em:
@@ -106,11 +166,43 @@ def _status_hint(error_message: str | None) -> str | None:
     return error_message
 
 
+def _is_recent_traffic_block(row: dict, now: datetime, window_sec: int = 900) -> bool:
+    if not row:
+        return False
+    err = str(row.get("error_message") or "").lower()
+    if not err:
+        return False
+    if "google_sorry_page" not in err and "unusual traffic" not in err:
+        return False
+    updated = _parse_utc(row.get("updated_at")) or _parse_utc(row.get("created_at"))
+    if not updated:
+        return False
+    age_sec = max(0, int((now - updated).total_seconds()))
+    return age_sec <= max(60, int(window_sec))
+
+
 async def _nudge_pending_request_now(row: dict) -> dict:
     """Force an existing pending request (possibly in retry wait) to run ASAP."""
     if not row:
         return row
     if row.get("status") != "PENDING":
+        return row
+    err = str(row.get("error_message") or "").lower()
+    # Respect cooldown/backoff for captcha/traffic/auth blocks.
+    protected_markers = (
+        "google_sorry_page",
+        "unusual traffic",
+        "captcha",
+        "recaptcha",
+        "traffic cooldown",
+        "token expired",
+        "api_401",
+        "invalid authentication credentials",
+        "flow_tab_not_ready",
+        "no_flow_tab",
+        "extension not connected",
+    )
+    if any(marker in err for marker in protected_markers):
         return row
     now = datetime.now(timezone.utc)
     next_retry = _parse_utc(row.get("next_retry_at"))
@@ -122,6 +214,33 @@ async def _nudge_pending_request_now(row: dict) -> dict:
         )
         return updated or row
     return row
+
+
+async def _project_traffic_cooldown_until(project_id: str | None) -> str | None:
+    if not project_id:
+        return None
+    rows = await crud.list_requests(project_id=project_id)
+    if not rows:
+        return None
+    now = datetime.now(timezone.utc)
+    latest: datetime | None = None
+    recent_traffic_seen = False
+    for row in rows:
+        err = str(row.get("error_message") or "").lower()
+        if "google_sorry_page" not in err and "unusual traffic" not in err:
+            continue
+        if _is_recent_traffic_block(row, now):
+            recent_traffic_seen = True
+        nr = _parse_utc(row.get("next_retry_at"))
+        if not nr or nr <= now:
+            continue
+        if not latest or nr > latest:
+            latest = nr
+    if latest:
+        return latest.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if recent_traffic_seen:
+        return (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
 
 
 class RequestUpdate(BaseModel):
@@ -235,26 +354,109 @@ async def create(body: RequestCreate):
 
     # Reject if there's already an active request for the same scene + type
     scene_id = data.get("scene_id")
+    character_id = data.get("character_id")
     req_type = data.get("req_type")
+    cooldown_until = await _project_traffic_cooldown_until(data.get("project_id"))
     if scene_id and req_type:
         existing = await crud.list_requests(scene_id=scene_id)
-        active = [r for r in existing
-                  if r.get("type") == req_type
-                  and r.get("status") in ("PENDING", "PROCESSING")]
+        active = [
+            r for r in existing
+            if r.get("status") in ("PENDING", "PROCESSING")
+            and _matches_logical_request(
+                r,
+                req_type=req_type,
+                scene_id=scene_id,
+                character_id=None,
+                orientation=data.get("orientation"),
+            )
+        ]
         if active:
             reused = active[0]
-            reused = await _nudge_pending_request_now(reused)
             raise HTTPException(
                 409,
                 f"Active {req_type} request already exists for scene {scene_id[:8]} "
                 f"(status={reused['status']}, id={reused['id'][:8]})"
             )
+        now = datetime.now(timezone.utc)
+        recent_traffic = next(
+            (
+                r for r in existing
+                if r.get("status") in ("FAILED", "PENDING")
+                and _matches_logical_request(
+                    r,
+                    req_type=req_type,
+                    scene_id=scene_id,
+                    character_id=None,
+                    orientation=data.get("orientation"),
+                )
+                and _is_recent_traffic_block(r, now)
+            ),
+            None,
+        )
+        if recent_traffic:
+            # Reuse instead of creating new rows that would immediately fail again.
+            revived = await crud.update_request(
+                recent_traffic["id"],
+                status="PENDING",
+                next_retry_at=recent_traffic.get("next_retry_at") or None,
+                error_message=recent_traffic.get("error_message") or "traffic cooldown",
+            )
+            return revived or recent_traffic
+    if character_id and req_type:
+        existing = await crud.list_requests(project_id=data.get("project_id"))
+        active = [
+            r for r in existing
+            if r.get("status") in ("PENDING", "PROCESSING")
+            and _matches_logical_request(
+                r,
+                req_type=req_type,
+                scene_id=None,
+                character_id=character_id,
+                orientation=None,
+            )
+        ]
+        if active:
+            reused = active[0]
+            raise HTTPException(
+                409,
+                f"Active {req_type} request already exists for character {character_id[:8]} "
+                f"(status={reused['status']}, id={reused['id'][:8]})"
+            )
+        now = datetime.now(timezone.utc)
+        recent_traffic = next(
+            (
+                r for r in existing
+                if r.get("status") in ("FAILED", "PENDING")
+                and _matches_logical_request(
+                    r,
+                    req_type=req_type,
+                    scene_id=None,
+                    character_id=character_id,
+                    orientation=None,
+                )
+                and _is_recent_traffic_block(r, now)
+            ),
+            None,
+        )
+        if recent_traffic:
+            revived = await crud.update_request(
+                recent_traffic["id"],
+                status="PENDING",
+                next_retry_at=recent_traffic.get("next_retry_at") or None,
+                error_message=recent_traffic.get("error_message") or "traffic cooldown",
+            )
+            return revived or recent_traffic
 
     # Auto-set video orientation (symmetric with batch endpoint)
     vid = data.get("video_id")
     orient = data.get("orientation")
     if vid and orient:
         await crud.update_video(vid, orientation=orient)
+
+    if cooldown_until and req_type in _CAPTCHA_TYPES:
+        data["status"] = "PENDING"
+        data["next_retry_at"] = cooldown_until
+        data["error_message"] = "traffic cooldown (project-wide): waiting for retry window"
 
     return await crud.create_request(**data)
 
@@ -263,8 +465,22 @@ async def create(body: RequestCreate):
 async def create_batch(body: BatchRequestCreate):
     """Submit multiple requests atomically. Server handles throttling (max 5 concurrent, 10s cooldown).
     Duplicate active requests for the same scene+type are skipped (not errors)."""
+    scene_regen_types = {"REGENERATE_IMAGE", "REGENERATE_VIDEO"}
+    scene_regen_count = sum(
+        1 for item in body.requests if getattr(item, "type", None) in scene_regen_types
+    )
+    if scene_regen_count > 1 or (
+        scene_regen_count == 1 and len(body.requests) > 1
+    ):
+        raise HTTPException(
+            400,
+            "Đã khóa tạo lại hàng loạt ảnh/video để tránh ghi đè nhầm. "
+            "Hãy tạo lại thủ công từng cảnh.",
+        )
+
     results = []
     _seen_vids: set[str] = set()
+    cooldown_by_project: dict[str, str | None] = {}
     for item in body.requests:
         data = item.model_dump(exclude_none=True)
         data["req_type"] = data.pop("type")
@@ -281,24 +497,97 @@ async def create_batch(body: BatchRequestCreate):
         scene_id = data.get("scene_id")
         character_id = data.get("character_id")
         req_type = data.get("req_type")
+        pid = str(data.get("project_id") or "")
+        if pid not in cooldown_by_project:
+            cooldown_by_project[pid] = await _project_traffic_cooldown_until(pid or None)
+        cooldown_until = cooldown_by_project[pid]
         # Idempotent: skip if active request already exists
         if scene_id and req_type:
             existing = await crud.list_requests(scene_id=scene_id)
-            active = [r for r in existing
-                      if r.get("type") == req_type
-                      and r.get("status") in ("PENDING", "PROCESSING")]
+            active = [
+                r for r in existing
+                if r.get("status") in ("PENDING", "PROCESSING")
+                and _matches_logical_request(
+                    r,
+                    req_type=req_type,
+                    scene_id=scene_id,
+                    character_id=None,
+                    orientation=data.get("orientation"),
+                )
+            ]
             if active:
-                results.append(await _nudge_pending_request_now(active[0]))
+                results.append(active[0])
+                continue
+            now = datetime.now(timezone.utc)
+            recent_traffic = next(
+                (
+                    r for r in existing
+                    if r.get("status") in ("FAILED", "PENDING")
+                    and _matches_logical_request(
+                        r,
+                        req_type=req_type,
+                        scene_id=scene_id,
+                        character_id=None,
+                        orientation=data.get("orientation"),
+                    )
+                    and _is_recent_traffic_block(r, now)
+                ),
+                None,
+            )
+            if recent_traffic:
+                revived = await crud.update_request(
+                    recent_traffic["id"],
+                    status="PENDING",
+                    next_retry_at=recent_traffic.get("next_retry_at") or None,
+                    error_message=recent_traffic.get("error_message") or "traffic cooldown",
+                )
+                results.append(revived or recent_traffic)
                 continue
         if character_id and req_type:
             existing = await crud.list_requests(project_id=data.get("project_id"))
-            active = [r for r in existing
-                      if r.get("character_id") == character_id
-                      and r.get("type") == req_type
-                      and r.get("status") in ("PENDING", "PROCESSING")]
+            active = [
+                r for r in existing
+                if r.get("status") in ("PENDING", "PROCESSING")
+                and _matches_logical_request(
+                    r,
+                    req_type=req_type,
+                    scene_id=None,
+                    character_id=character_id,
+                    orientation=None,
+                )
+            ]
             if active:
-                results.append(await _nudge_pending_request_now(active[0]))
+                results.append(active[0])
                 continue
+            now = datetime.now(timezone.utc)
+            recent_traffic = next(
+                (
+                    r for r in existing
+                    if r.get("status") in ("FAILED", "PENDING")
+                    and _matches_logical_request(
+                        r,
+                        req_type=req_type,
+                        scene_id=None,
+                        character_id=character_id,
+                        orientation=None,
+                    )
+                    and _is_recent_traffic_block(r, now)
+                ),
+                None,
+            )
+            if recent_traffic:
+                revived = await crud.update_request(
+                    recent_traffic["id"],
+                    status="PENDING",
+                    next_retry_at=recent_traffic.get("next_retry_at") or None,
+                    error_message=recent_traffic.get("error_message") or "traffic cooldown",
+                )
+                results.append(revived or recent_traffic)
+                continue
+        if cooldown_until and req_type in _CAPTCHA_TYPES:
+            data["status"] = "PENDING"
+            data["next_retry_at"] = cooldown_until
+            data["error_message"] = "traffic cooldown (project-wide): waiting for retry window"
         results.append(await crud.create_request(**data))
     return results
 

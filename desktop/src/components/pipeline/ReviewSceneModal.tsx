@@ -139,6 +139,10 @@ export default function ReviewSceneModal({
     }
 
     const regenerateSceneVideo = async () => {
+        const ok = window.confirm(
+            `Tạo lại video cho scene …${sceneId.slice(-8)}? Thao tác này có thể ghi đè video hiện tại của scene này.`,
+        )
+        if (!ok) return
         setRegenning(true)
         setError('')
         setStatusMsg('')

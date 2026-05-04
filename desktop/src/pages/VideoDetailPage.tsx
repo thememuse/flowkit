@@ -62,6 +62,12 @@ import { Label } from "../components/ui/label";
 import { Separator } from "../components/ui/separator";
 import { Dialog, DialogContent } from "../components/ui/dialog";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "../components/ui/tooltip";
+import {
   normalizeOrientation,
   orientationAspect,
   orientationPrefix,
@@ -76,9 +82,12 @@ interface Props {
   onBack: () => void;
 }
 
-interface SceneFailureSummary {
-  imageIds: string[];
-  videoIds: string[];
+interface SafeRetrySummary {
+  imageRetryable: number;
+  videoRetryable: number;
+  imageFailedHasMedia: number;
+  videoFailedHasMedia: number;
+  videoFailedMissingImage: number;
 }
 
 interface SceneImageSource {
@@ -468,6 +477,11 @@ function SceneEditor({
   };
 
   const regen = async (type: "REGENERATE_IMAGE" | "REGENERATE_VIDEO") => {
+    const target = type === "REGENERATE_IMAGE" ? "ảnh" : "video";
+    const ok = window.confirm(
+      `Tạo lại ${target} cho cảnh #${scene.display_order + 1}? Thao tác này có thể ghi đè media hiện tại của cảnh này.`,
+    );
+    if (!ok) return;
     setRegenMsg(
       `Đang gửi yêu cầu ${type === "REGENERATE_IMAGE" ? "tạo lại ảnh" : "tạo lại video"}...`,
     );
@@ -523,7 +537,7 @@ Requirements:
 - Remove/soften explicit violence, gore, hate, sexual, extremist cues.
 - If conflict exists, convert to non-graphic cinematic language (e.g. tension, aftermath, diplomacy, strategic movement).
 - image prompt must be in English.
-- video_prompt format: "0-3s: ... 3-6s: ... 6-8s: ...".
+- video_prompt can use varied timing styles (e.g. [00:00-00:02]/[00:02-00:05]/[00:05-00:08], or 0-4s/4-8s, or single-take 8s). Avoid rigid same template every scene.
 - narrator_text keep the same language style as input narrator_text.
 
 Return JSON:
@@ -854,44 +868,19 @@ function PipelineBar({
   const [preflightChecks, setPreflightChecks] = useState<PreflightCheckItem[]>(
     [],
   );
-  const [failedImageCount, setFailedImageCount] = useState(0);
-  const [failedVideoCount, setFailedVideoCount] = useState(0);
-  const [retryingFailedImages, setRetryingFailedImages] = useState(false);
-  const [retryingFailedVideos, setRetryingFailedVideos] = useState(false);
   const [batchMsg, setBatchMsg] = useState("");
   const [downloadingAssets, setDownloadingAssets] = useState(false);
   const [downloadAssetsDir, setDownloadAssetsDir] = useState("");
-
-  const loadSceneFailures =
-    useCallback(async (): Promise<SceneFailureSummary> => {
-      const scenes = await fetchAPI<Scene[]>(`/api/scenes?video_id=${videoId}`);
-      const imageIds = scenes
-        .filter(
-          (scene) => sceneStatus(scene, orientation, "image") === "FAILED",
-        )
-        .map((scene) => scene.id);
-      const videoIds = scenes
-        .filter(
-          (scene) => sceneStatus(scene, orientation, "video") === "FAILED",
-        )
-        .map((scene) => scene.id);
-      return { imageIds, videoIds };
-    }, [videoId, orientation]);
-
-  const refreshFailureCounts = useCallback(async () => {
-    try {
-      const summary = await loadSceneFailures();
-      setFailedImageCount(summary.imageIds.length);
-      setFailedVideoCount(summary.videoIds.length);
-    } catch {
-      setFailedImageCount(0);
-      setFailedVideoCount(0);
-    }
-  }, [loadSceneFailures]);
-
-  useEffect(() => {
-    refreshFailureCounts();
-  }, [refreshFailureCounts, lastEventType]);
+  const [retryingFailedStage, setRetryingFailedStage] = useState<
+    "image" | "video" | null
+  >(null);
+  const [safeRetrySummary, setSafeRetrySummary] = useState<SafeRetrySummary>({
+    imageRetryable: 0,
+    videoRetryable: 0,
+    imageFailedHasMedia: 0,
+    videoFailedHasMedia: 0,
+    videoFailedMissingImage: 0,
+  });
 
   const queueMissingRefs = async () => {
     const chars = await fetchAPI<{ id: string; media_id: string | null }[]>(
@@ -931,11 +920,72 @@ function PipelineBar({
     return typeof mediaId === "string" && mediaId.trim().length > 0;
   };
 
+  const isBatchLockedImageScene = (scene: Scene): boolean =>
+    hasReadyImageForOrientation(scene) ||
+    sceneStatus(scene, orientation, "image") === "COMPLETED";
+
+  const isBatchLockedVideoScene = (scene: Scene): boolean =>
+    hasReadyVideoForOrientation(scene) ||
+    sceneStatus(scene, orientation, "video") === "COMPLETED";
+
+  const buildSafeRetrySummary = (allScenes: Scene[]) => {
+    const imageRetryableScenes: Scene[] = [];
+    const videoRetryableScenes: Scene[] = [];
+    let imageFailedHasMedia = 0;
+    let videoFailedHasMedia = 0;
+    let videoFailedMissingImage = 0;
+
+    for (const scene of allScenes) {
+      const imageFailed = sceneStatus(scene, orientation, "image") === "FAILED";
+      const videoFailed = sceneStatus(scene, orientation, "video") === "FAILED";
+      const hasImage = hasReadyImageForOrientation(scene);
+      const hasVideo = hasReadyVideoForOrientation(scene);
+
+      if (imageFailed) {
+        if (!hasImage) imageRetryableScenes.push(scene);
+        else imageFailedHasMedia += 1;
+      }
+
+      if (videoFailed) {
+        if (hasVideo) {
+          videoFailedHasMedia += 1;
+        } else if (!hasImage) {
+          videoFailedMissingImage += 1;
+        } else {
+          videoRetryableScenes.push(scene);
+        }
+      }
+    }
+
+    const summary: SafeRetrySummary = {
+      imageRetryable: imageRetryableScenes.length,
+      videoRetryable: videoRetryableScenes.length,
+      imageFailedHasMedia,
+      videoFailedHasMedia,
+      videoFailedMissingImage,
+    };
+
+    return { imageRetryableScenes, videoRetryableScenes, summary };
+  };
+
+  const refreshSafeRetrySummary = useCallback(async () => {
+    try {
+      const rows = await fetchAPI<Scene[]>(`/api/scenes?video_id=${videoId}`);
+      const { summary } = buildSafeRetrySummary(rows);
+      setSafeRetrySummary(summary);
+    } catch {
+      // keep latest known counters
+    }
+  }, [orientation, videoId]);
+
+  useEffect(() => {
+    void refreshSafeRetrySummary();
+  }, [refreshSafeRetrySummary, lastEventType]);
+
   const queueMissingImages = async () => {
     const scenes = await fetchAPI<Scene[]>(`/api/scenes?video_id=${videoId}`);
-    const missing = scenes.filter(
-      (s) => sceneStatus(s, orientation, "image") !== "COMPLETED",
-    );
+    const missing = scenes.filter((s) => !isBatchLockedImageScene(s));
+    const locked = scenes.length - missing.length;
     const requests = missing.map((s) => ({
       type: "GENERATE_IMAGE",
       project_id: projectId,
@@ -948,16 +998,21 @@ function PipelineBar({
       method: "POST",
       body: JSON.stringify({ requests }),
     });
-    setBatchMsg(`✓ Đã gửi tạo ảnh cho ${requests.length} cảnh còn thiếu.`);
+    setBatchMsg(
+      `✓ Đã gửi tạo ảnh cho ${requests.length} cảnh còn thiếu${
+        locked > 0
+          ? ` · đã bỏ qua ${locked} cảnh đã có ảnh (chỉ có thể tạo lại thủ công từng cảnh)`
+          : ""
+      }.`,
+    );
     return requests.length;
   };
 
   const queueMissingVideos = async () => {
     const scenes = await fetchAPI<Scene[]>(`/api/scenes?video_id=${videoId}`);
     const readyScenes = scenes.filter(hasReadyImageForOrientation);
-    const missing = readyScenes.filter(
-      (s) => sceneStatus(s, orientation, "video") !== "COMPLETED",
-    );
+    const missing = readyScenes.filter((s) => !isBatchLockedVideoScene(s));
+    const locked = readyScenes.length - missing.length;
     const skippedNoImage = scenes.length - readyScenes.length;
     const requests = missing.map((s) => ({
       type: "GENERATE_VIDEO",
@@ -981,9 +1036,136 @@ function PipelineBar({
     setBatchMsg(
       `✓ Đã gửi tạo video cho ${requests.length} cảnh đã có ảnh${
         skippedNoImage > 0 ? ` (bỏ qua ${skippedNoImage} cảnh thiếu ảnh)` : ""
+      }${
+        locked > 0
+          ? ` · bỏ qua ${locked} cảnh đã có video (chỉ có thể tạo lại thủ công từng cảnh)`
+          : ""
       }.`,
     );
     return requests.length;
+  };
+
+  const retryFailedImagesSafe = async () => {
+    setBatchMsg("");
+    setRetryingFailedStage("image");
+    try {
+      const scenes = await fetchAPI<Scene[]>(`/api/scenes?video_id=${videoId}`);
+      const { imageRetryableScenes, summary } = buildSafeRetrySummary(scenes);
+      setSafeRetrySummary(summary);
+
+      if (!imageRetryableScenes.length) {
+        if (summary.imageFailedHasMedia > 0) {
+          setBatchMsg(
+            `Không có ảnh lỗi nào đủ điều kiện retry an toàn. Đã bỏ qua ${summary.imageFailedHasMedia} cảnh FAILED nhưng đã có ảnh.`,
+          );
+        } else {
+          setBatchMsg("Không có cảnh ảnh lỗi cần retry.");
+        }
+        return;
+      }
+
+      const confirmText = [
+        `Retry an toàn ${imageRetryableScenes.length} cảnh ảnh lỗi?`,
+        "- Chỉ chạy cho cảnh FAILED và chưa có media ảnh.",
+        `- Bỏ qua ${summary.imageFailedHasMedia} cảnh FAILED đã có ảnh để tránh ghi đè.`,
+        "",
+        "Tiếp tục gửi batch GENERATE_IMAGE?",
+      ].join("\n");
+      if (!window.confirm(confirmText)) {
+        setBatchMsg("Đã hủy retry ảnh lỗi.");
+        return;
+      }
+
+      await fetchAPI("/api/requests/batch", {
+        method: "POST",
+        body: JSON.stringify({
+          requests: imageRetryableScenes.map((scene) => ({
+            type: "GENERATE_IMAGE",
+            project_id: projectId,
+            video_id: videoId,
+            scene_id: scene.id,
+            orientation,
+          })),
+        }),
+      });
+
+      setBatchMsg(
+        `✓ Đã gửi retry an toàn ảnh lỗi cho ${imageRetryableScenes.length} cảnh${
+          summary.imageFailedHasMedia > 0
+            ? ` · bỏ qua ${summary.imageFailedHasMedia} cảnh FAILED đã có ảnh`
+            : ""
+        }.`,
+      );
+      await refreshSafeRetrySummary();
+    } catch (e: any) {
+      setBatchMsg(`Lỗi retry ảnh lỗi: ${String(e?.message ?? "unknown")}`);
+    } finally {
+      setRetryingFailedStage(null);
+    }
+  };
+
+  const retryFailedVideosSafe = async () => {
+    setBatchMsg("");
+    setRetryingFailedStage("video");
+    try {
+      const scenes = await fetchAPI<Scene[]>(`/api/scenes?video_id=${videoId}`);
+      const { videoRetryableScenes, summary } = buildSafeRetrySummary(scenes);
+      setSafeRetrySummary(summary);
+
+      if (!videoRetryableScenes.length) {
+        if (summary.videoFailedHasMedia > 0 || summary.videoFailedMissingImage > 0) {
+          setBatchMsg(
+            `Không có video lỗi nào đủ điều kiện retry an toàn. Bỏ qua ${summary.videoFailedHasMedia} cảnh FAILED đã có video và ${summary.videoFailedMissingImage} cảnh FAILED nhưng chưa có ảnh nguồn.`,
+          );
+        } else {
+          setBatchMsg("Không có cảnh video lỗi cần retry.");
+        }
+        return;
+      }
+
+      const confirmText = [
+        `Retry an toàn ${videoRetryableScenes.length} cảnh video lỗi?`,
+        "- Chỉ chạy cho cảnh FAILED, chưa có media video và đã có ảnh nguồn.",
+        `- Bỏ qua ${summary.videoFailedHasMedia} cảnh FAILED đã có video để tránh ghi đè.`,
+        `- Bỏ qua ${summary.videoFailedMissingImage} cảnh FAILED nhưng chưa có ảnh nguồn.`,
+        "",
+        "Tiếp tục gửi batch GENERATE_VIDEO?",
+      ].join("\n");
+      if (!window.confirm(confirmText)) {
+        setBatchMsg("Đã hủy retry video lỗi.");
+        return;
+      }
+
+      await fetchAPI("/api/requests/batch", {
+        method: "POST",
+        body: JSON.stringify({
+          requests: videoRetryableScenes.map((scene) => ({
+            type: "GENERATE_VIDEO",
+            project_id: projectId,
+            video_id: videoId,
+            scene_id: scene.id,
+            orientation,
+          })),
+        }),
+      });
+
+      setBatchMsg(
+        `✓ Đã gửi retry an toàn video lỗi cho ${videoRetryableScenes.length} cảnh${
+          summary.videoFailedHasMedia > 0
+            ? ` · bỏ qua ${summary.videoFailedHasMedia} cảnh FAILED đã có video`
+            : ""
+        }${
+          summary.videoFailedMissingImage > 0
+            ? ` · bỏ qua ${summary.videoFailedMissingImage} cảnh FAILED chưa có ảnh`
+            : ""
+        }.`,
+      );
+      await refreshSafeRetrySummary();
+    } catch (e: any) {
+      setBatchMsg(`Lỗi retry video lỗi: ${String(e?.message ?? "unknown")}`);
+    } finally {
+      setRetryingFailedStage(null);
+    }
   };
 
   const genRefs = async () => {
@@ -992,14 +1174,21 @@ function PipelineBar({
   };
 
   const genImages = async () => {
-    const scenes = await fetchAPI<{ id: string }[]>(
+    const scenes = await fetchAPI<Scene[]>(
       `/api/scenes?video_id=${videoId}`,
     );
     if (!scenes.length) throw new Error("Chưa có phân cảnh nào.");
+    const targetScenes = scenes.filter((s) => !isBatchLockedImageScene(s));
+    if (!targetScenes.length) {
+      setBatchMsg(
+        "Tất cả cảnh đã có ảnh. Để tránh ghi đè nhầm, chỉ có thể tạo lại thủ công từng cảnh.",
+      );
+      return;
+    }
     await fetchAPI("/api/requests/batch", {
       method: "POST",
       body: JSON.stringify({
-        requests: scenes.map((s) => ({
+        requests: targetScenes.map((s) => ({
           type: "GENERATE_IMAGE",
           project_id: projectId,
           video_id: videoId,
@@ -1008,7 +1197,14 @@ function PipelineBar({
         })),
       }),
     });
-    setBatchMsg(`✓ Đã gửi tạo ảnh cho ${scenes.length} cảnh.`);
+    const locked = scenes.length - targetScenes.length;
+    setBatchMsg(
+      `✓ Đã gửi tạo ảnh cho ${targetScenes.length} cảnh còn thiếu${
+        locked > 0
+          ? ` · bỏ qua ${locked} cảnh đã có ảnh (tạo lại chỉ cho từng cảnh)`
+          : ""
+      }.`,
+    );
   };
 
   const genVideos = async () => {
@@ -1017,17 +1213,18 @@ function PipelineBar({
     );
     if (!scenes.length) throw new Error("Chưa có phân cảnh nào.");
     const readyScenes = scenes.filter(hasReadyImageForOrientation);
-    const targetScenes = readyScenes.filter(
-      (s) => sceneStatus(s, orientation, "video") !== "COMPLETED",
-    );
+    const targetScenes = readyScenes.filter((s) => !isBatchLockedVideoScene(s));
     if (!targetScenes.length) {
       if (!readyScenes.length) {
         throw new Error("Chưa có cảnh nào có ảnh sẵn sàng để tạo video.");
       }
-      setBatchMsg("Tất cả cảnh đã có ảnh đều đã có video.");
+      setBatchMsg(
+        "Tất cả cảnh đã có ảnh đều đã có video. Để tránh ghi đè nhầm, chỉ có thể tạo lại thủ công từng cảnh.",
+      );
       return;
     }
     const skippedNoImage = scenes.length - readyScenes.length;
+    const locked = readyScenes.length - targetScenes.length;
     await fetchAPI("/api/requests/batch", {
       method: "POST",
       body: JSON.stringify({
@@ -1043,6 +1240,10 @@ function PipelineBar({
     setBatchMsg(
       `✓ Đã gửi tạo video cho ${targetScenes.length} cảnh đã có ảnh${
         skippedNoImage > 0 ? ` (bỏ qua ${skippedNoImage} cảnh thiếu ảnh)` : ""
+      }${
+        locked > 0
+          ? ` · bỏ qua ${locked} cảnh đã có video (tạo lại chỉ cho từng cảnh)`
+          : ""
       }.`,
     );
   };
@@ -1053,17 +1254,18 @@ function PipelineBar({
     );
     if (!scenes.length) throw new Error("Chưa có phân cảnh nào.");
     const readyScenes = scenes.filter(hasReadyImageForOrientation);
-    const targetScenes = readyScenes.filter(
-      (s) => sceneStatus(s, orientation, "video") !== "COMPLETED",
-    );
+    const targetScenes = readyScenes.filter((s) => !isBatchLockedVideoScene(s));
     if (!targetScenes.length) {
       if (!readyScenes.length) {
         throw new Error("Chưa có cảnh nào có ảnh sẵn sàng để tạo video refs.");
       }
-      setBatchMsg("Tất cả cảnh đã có ảnh đều đã có video.");
+      setBatchMsg(
+        "Tất cả cảnh đã có ảnh đều đã có video. Để tránh ghi đè nhầm, chỉ có thể tạo lại thủ công từng cảnh.",
+      );
       return;
     }
     const skippedNoImage = scenes.length - readyScenes.length;
+    const locked = readyScenes.length - targetScenes.length;
     await fetchAPI("/api/requests/batch", {
       method: "POST",
       body: JSON.stringify({
@@ -1079,6 +1281,10 @@ function PipelineBar({
     setBatchMsg(
       `✓ Đã gửi tạo video refs cho ${targetScenes.length} cảnh đã có ảnh${
         skippedNoImage > 0 ? ` (bỏ qua ${skippedNoImage} cảnh thiếu ảnh)` : ""
+      }${
+        locked > 0
+          ? ` · bỏ qua ${locked} cảnh đã có video (tạo lại chỉ cho từng cảnh)`
+          : ""
       }.`,
     );
   };
@@ -1351,66 +1557,6 @@ function PipelineBar({
     setShowPreflight(false);
   };
 
-  const regenFailedImages = async () => {
-    setRetryingFailedImages(true);
-    setBatchMsg("");
-    try {
-      const { imageIds } = await loadSceneFailures();
-      if (imageIds.length === 0) {
-        setBatchMsg("Không có cảnh ảnh lỗi để tạo lại.");
-        return;
-      }
-      await fetchAPI("/api/requests/batch", {
-        method: "POST",
-        body: JSON.stringify({
-          requests: imageIds.map((sceneId) => ({
-            type: "REGENERATE_IMAGE",
-            project_id: projectId,
-            video_id: videoId,
-            scene_id: sceneId,
-            orientation,
-          })),
-        }),
-      });
-      setBatchMsg(`✓ Đã gửi tạo lại ảnh cho ${imageIds.length} cảnh lỗi.`);
-      setFailedImageCount(0);
-    } catch (e: any) {
-      setBatchMsg(`Lỗi tạo lại ảnh lỗi: ${e?.message ?? "unknown"}`);
-    } finally {
-      setRetryingFailedImages(false);
-    }
-  };
-
-  const regenFailedVideos = async () => {
-    setRetryingFailedVideos(true);
-    setBatchMsg("");
-    try {
-      const { videoIds } = await loadSceneFailures();
-      if (videoIds.length === 0) {
-        setBatchMsg("Không có cảnh video lỗi để tạo lại.");
-        return;
-      }
-      await fetchAPI("/api/requests/batch", {
-        method: "POST",
-        body: JSON.stringify({
-          requests: videoIds.map((sceneId) => ({
-            type: "REGENERATE_VIDEO",
-            project_id: projectId,
-            video_id: videoId,
-            scene_id: sceneId,
-            orientation,
-          })),
-        }),
-      });
-      setBatchMsg(`✓ Đã gửi tạo lại video cho ${videoIds.length} cảnh lỗi.`);
-      setFailedVideoCount(0);
-    } catch (e: any) {
-      setBatchMsg(`Lỗi tạo lại video lỗi: ${e?.message ?? "unknown"}`);
-    } finally {
-      setRetryingFailedVideos(false);
-    }
-  };
-
   return (
     <>
       <div className="flex-shrink-0 rounded-lg p-3 flex flex-col gap-2.5 border border-[hsl(var(--border))] bg-[hsl(var(--card))]">
@@ -1434,7 +1580,7 @@ function PipelineBar({
                 void openPreflight("images");
               }}
             >
-              <Image size={11} /> Gen Hình cảnh
+              <Image size={11} /> Gen Hình cảnh (thiếu)
             </Button>
             <Button
               variant="secondary"
@@ -1443,8 +1589,70 @@ function PipelineBar({
                 void openPreflight("videos");
               }}
             >
-              <Film size={11} /> Gen Video clip
+              <Film size={11} /> Gen Video clip (thiếu)
             </Button>
+            <TooltipProvider delayDuration={120}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        void retryFailedImagesSafe();
+                      }}
+                      disabled={
+                        retryingFailedStage !== null ||
+                        safeRetrySummary.imageRetryable === 0
+                      }
+                    >
+                      <RefreshCw
+                        size={11}
+                        className={
+                          retryingFailedStage === "image" ? "animate-spin" : ""
+                        }
+                      />{" "}
+                      Tạo lại ảnh lỗi ({safeRetrySummary.imageRetryable})
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-[320px] leading-relaxed">
+                  Retry an toàn chỉ cho cảnh ảnh FAILED và chưa có media ảnh.
+                  Scene đã có ảnh sẽ tự bỏ qua để tránh ghi đè.
+                </TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        void retryFailedVideosSafe();
+                      }}
+                      disabled={
+                        retryingFailedStage !== null ||
+                        safeRetrySummary.videoRetryable === 0
+                      }
+                    >
+                      <RefreshCw
+                        size={11}
+                        className={
+                          retryingFailedStage === "video" ? "animate-spin" : ""
+                        }
+                      />{" "}
+                      Tạo lại video lỗi ({safeRetrySummary.videoRetryable})
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-[340px] leading-relaxed">
+                  Retry an toàn chỉ cho cảnh video FAILED, chưa có media video
+                  và đã có ảnh nguồn. Scene đã có video sẽ tự bỏ qua để tránh
+                  ghi đè.
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <Button
               variant="secondary"
               size="sm"
@@ -1470,44 +1678,15 @@ function PipelineBar({
             >
               <Zap size={11} /> Nâng 4K local
             </Button>
-            <Button
+            <Badge
               variant="outline"
-              size="sm"
-              onClick={regenFailedImages}
-              disabled={retryingFailedImages || failedImageCount === 0}
-              className={
-                failedImageCount > 0
-                  ? "border-red-300 text-red-600 hover:bg-red-50"
-                  : ""
-              }
+              className="h-7 px-2 text-[10px] border-amber-300 text-amber-700 bg-amber-50"
             >
-              <RefreshCw
-                size={11}
-                className={retryingFailedImages ? "animate-spin" : ""}
-              />
-              {retryingFailedImages
-                ? "Đang tạo lại ảnh lỗi..."
-                : `Tạo lại ảnh lỗi (${failedImageCount})`}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={regenFailedVideos}
-              disabled={retryingFailedVideos || failedVideoCount === 0}
-              className={
-                failedVideoCount > 0
-                  ? "border-red-300 text-red-600 hover:bg-red-50"
-                  : ""
-              }
-            >
-              <RefreshCw
-                size={11}
-                className={retryingFailedVideos ? "animate-spin" : ""}
-              />
-              {retryingFailedVideos
-                ? "Đang tạo lại video lỗi..."
-                : `Tạo lại video lỗi (${failedVideoCount})`}
-            </Button>
+              Khóa tạo lại hàng loạt REGENERATE · 2 nút retry chỉ chạy an toàn cho cảnh lỗi thiếu media
+            </Badge>
+          </div>
+          <div className="text-[11px] text-[hsl(var(--muted-foreground))]">
+            Retry an toàn: chỉ queue lại scene FAILED còn thiếu media, tự bỏ qua scene đã có media để tránh ghi đè nhầm.
           </div>
           {batchMsg && (
             <div
