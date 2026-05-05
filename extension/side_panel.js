@@ -79,9 +79,12 @@ function formatType(type) {
 
 function mapLocalStatus(data) {
   if (!data || typeof data !== 'object') return null;
+  const runtimeConnected = data.runtimeConnected !== undefined
+    ? !!data.runtimeConnected
+    : !!data.connected;
   return {
     source: 'local',
-    connected: !!data.connected,
+    connected: runtimeConnected,
     agentConnected: data.agentConnected !== undefined ? !!data.agentConnected : !!data.connected,
     state: String(data.state || 'off').toLowerCase(),
     manualDisconnect: !!data.manualDisconnect,

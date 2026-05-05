@@ -402,6 +402,10 @@ class WorkerController:
         self._deferred: dict[str, float] = {}  # rid -> defer_until timestamp
         self._retry_after: dict[str, float] = {}  # rid -> retry_after timestamp
         self._group_retry_after: dict[str, float] = {}  # group key -> retry_after timestamp
+        self._runtime_ready_until: float = 0.0
+        self._runtime_block_reason: str = ""
+        self._last_runtime_warn_at: float = 0.0
+        self._last_runtime_refresh_at: float = 0.0
 
     def _image_safe_mode_active(self, now: float) -> bool:
         return self._group_retry_after.get("image_safe_mode_until", 0.0) > now
@@ -539,6 +543,37 @@ class WorkerController:
                     continue
 
                 now = time.time()
+                if now >= self._runtime_ready_until:
+                    ext_status = await client.get_extension_status()
+                    runtime_connected = bool(ext_status.get("runtime_connected"))
+                    if not runtime_connected:
+                        flow_key_present = bool(ext_status.get("flow_key_present"))
+                        raw_state = str(ext_status.get("raw_state") or ext_status.get("state") or "off").lower()
+                        reason = "NO_FLOW_KEY" if not flow_key_present else f"EXTENSION_{raw_state.upper()}"
+                        self._runtime_ready_until = now + 4.0
+                        self._runtime_block_reason = reason
+
+                        if not flow_key_present and now - self._last_runtime_refresh_at >= 15.0:
+                            self._last_runtime_refresh_at = now
+                            try:
+                                await client.refresh_token()
+                            except Exception:
+                                pass
+
+                        if now - self._last_runtime_warn_at >= 8.0:
+                            self._last_runtime_warn_at = now
+                            logger.warning(
+                                "Worker paused dispatch: extension runtime not ready (%s, token=%s, ws=%s)",
+                                reason,
+                                "yes" if flow_key_present else "no",
+                                "yes" if client.connected else "no",
+                            )
+                        await asyncio.sleep(min(POLL_INTERVAL, 1))
+                        continue
+
+                    self._runtime_ready_until = now + 2.0
+                    self._runtime_block_reason = ""
+
                 slots_available = MAX_CONCURRENT_REQUESTS - len(self._active_ids)
                 if slots_available <= 0:
                     # Keep scheduler reactive while active jobs are running.
@@ -1138,6 +1173,34 @@ async def _handle_failure(
             return
 
     error_lower = str(error_msg).lower()
+
+    # Extension runtime is connected but token is missing/not captured yet.
+    # Keep request pending and trigger token refresh without burning retry budget.
+    if (
+        "no_flow_key" in error_lower
+        or "no flow key" in error_lower
+        or "token missing" in error_lower
+        or "token pending verify" in error_lower
+    ):
+        delay = 20
+        if retry_after is not None:
+            retry_after[rid] = time.time() + delay
+        await crud.update_request(
+            rid,
+            status="PENDING",
+            error_message=str(error_msg),
+            next_retry_at=_iso_after(delay),
+        )
+        await _mark_scene_pending(req, status="PENDING")
+        try:
+            await get_flow_client().refresh_token()
+        except Exception:
+            pass
+        logger.warning(
+            "Request %s waiting for Flow token, deferred %ss without retry increment",
+            rid[:8], delay
+        )
+        return
 
     # OAuth token/auth failures: ask extension to refresh token and retry soon,
     # without burning retry_count.

@@ -1524,11 +1524,14 @@ async function connectToAgent() {
             // ignore status best-effort tab probing
           }
         }
+        const runtimeConnected =
+          ws?.readyState === WebSocket.OPEN && !manualDisconnect && !!flowKey && state !== "off";
         sendToAgent({
           id: msg.id,
           result: {
             connected: ws?.readyState === WebSocket.OPEN,
             agentConnected: ws?.readyState === WebSocket.OPEN,
+            runtimeConnected,
             state,
             activeProjectId: inferActiveProjectId(),
             flowKeyPresent: !!flowKey,
@@ -2588,7 +2591,6 @@ async function handleApiRequest(msg) {
     return;
   }
 
-  setState("running");
   const hasCaptcha = !!captchaAction;
   const isVideoStatusPoll =
     /batchcheckasyncvideogenerationstatus/i.test(String(url || ""));
@@ -2706,6 +2708,7 @@ async function handleApiRequest(msg) {
     }
 
     // Step 4: Send API request (with one-shot auth refresh retry on 401).
+    setState("running");
     // Prefer Flow-tab context for generation calls to stay closest to real user browsing context.
     const methodUpper = String(method || "POST").toUpperCase();
     // Polling video operation status via background fetch often triggers 403/traffic
@@ -2997,9 +3000,12 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg.type === "STATUS") {
     clearTrafficCooldownIfExpired();
     const trafficCooldownMs = trafficCooldownRemainingMs();
+    const runtimeConnected =
+      ws?.readyState === WebSocket.OPEN && !manualDisconnect && !!flowKey && state !== "off";
     reply({
       connected: ws?.readyState === WebSocket.OPEN,
       agentConnected: ws?.readyState === WebSocket.OPEN,
+      runtimeConnected,
       flowKeyPresent: !!flowKey,
       manualDisconnect,
       activeProjectId: inferActiveProjectId(),

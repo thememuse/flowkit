@@ -2231,15 +2231,26 @@ class FlowClient:
         elif not data.get("state") and not data.get("flowKeyPresent"):
             logger.warning("get_extension_status sparse payload: %s", str(result)[:260])
         agent_connected = bool(data.get("agentConnected", data.get("connected", self.connected)))
-        state = str(data.get("state") or ("idle" if agent_connected else "off")).lower()
+        raw_state = str(data.get("state") or ("idle" if agent_connected else "off")).lower()
         manual_disconnect = bool(data.get("manualDisconnect", False))
         flow_key_present = bool(data.get("flowKeyPresent", self._flow_key))
-        runtime_connected = agent_connected and not manual_disconnect and state != "off"
+        explicit_runtime_connected = data.get("runtimeConnected")
+        if explicit_runtime_connected is None:
+            runtime_connected = (
+                agent_connected
+                and not manual_disconnect
+                and raw_state != "off"
+                and flow_key_present
+            )
+        else:
+            runtime_connected = bool(explicit_runtime_connected) and flow_key_present and not manual_disconnect
+        state = raw_state if runtime_connected else "off"
         return {
             "connected": self.connected,
             "agent_connected": agent_connected,
             "flow_key_present": flow_key_present,
             "state": state,
+            "raw_state": raw_state,
             "manual_disconnect": manual_disconnect,
             "runtime_connected": runtime_connected,
             "flow_tab_id": data.get("flowTabId"),

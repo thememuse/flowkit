@@ -182,7 +182,7 @@ function AppWindowHeader() {
 function Layout() {
     const { isConnected } = useWebSocket()
     const { connected: extensionConnected } = useExtensionStatus()
-    const [appVersion, setAppVersion] = useState('0.2.0')
+    const [appVersion, setAppVersion] = useState('0.2.1')
     const [flowPanelVisible, setFlowPanelVisible] = useState(true)
     const location = useLocation()
 
