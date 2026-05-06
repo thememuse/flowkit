@@ -106,6 +106,7 @@ _OP_NAME_RE = re.compile(r"Operation failed:\s*([A-Za-z0-9_-]+)")
 _SUBMIT_PENDING_PREFIX = "submit_pending_until:"
 _LOCAL_UPSCALE_SETUP_MARKER = "local_upscale_setup_required"
 _TRAFFIC_COOLDOWN_RE = re.compile(r"traffic cooldown active\s+(\d+)s")
+_STAGE_RECONCILE_INTERVAL_SEC = 10.0
 
 # Backward-compatible module-level retry map used by unit tests and as
 # fallback state when _handle_failure is called without explicit retry dict.
@@ -406,6 +407,7 @@ class WorkerController:
         self._runtime_block_reason: str = ""
         self._last_runtime_warn_at: float = 0.0
         self._last_runtime_refresh_at: float = 0.0
+        self._last_stage_reconcile_at: float = 0.0
 
     def _image_safe_mode_active(self, now: float) -> bool:
         return self._group_retry_after.get("image_safe_mode_until", 0.0) > now
@@ -530,14 +532,50 @@ class WorkerController:
                     continue
             if healed:
                 logger.info("Healed %d pending request scene statuses to PENDING", healed)
+            # Heal stale FAILED/PENDING rows that already have completed stage media.
+            # This commonly happens when Flow generated media but API bridge returned
+            # transient captcha/traffic errors for the same logical stage.
+            reconciled = await self._reconcile_completed_stage_requests(limit_per_status=600)
+            if reconciled:
+                logger.info("Reconciled %d stale request(s) from completed stage state", reconciled)
         except Exception as e:
             logger.warning("Could not clean up stale requests: %s", e)
+
+    async def _reconcile_completed_stage_requests(self, *, limit_per_status: int = 120) -> int:
+        """Mark stale non-completed requests as COMPLETED when stage already has media."""
+        reconciled = 0
+        for status in ("FAILED", "PENDING", "PROCESSING"):
+            try:
+                rows = await crud.list_requests(status=status)
+            except Exception:
+                continue
+            if not rows:
+                continue
+            for row in rows[: max(1, int(limit_per_status))]:
+                rid = row.get("id")
+                if not rid or rid in self._active_ids:
+                    continue
+                if row.get("type") not in _API_CALL_TYPES:
+                    continue
+                try:
+                    if await _try_reconcile_existing_stage_state(rid, row):
+                        reconciled += 1
+                except Exception:
+                    continue
+        return reconciled
 
     async def _run_loop(self):
         client = get_flow_client()
 
         while not self._shutdown.is_set():
             try:
+                now = time.time()
+                if now - self._last_stage_reconcile_at >= _STAGE_RECONCILE_INTERVAL_SEC:
+                    self._last_stage_reconcile_at = now
+                    reconciled = await self._reconcile_completed_stage_requests(limit_per_status=180)
+                    if reconciled:
+                        logger.info("Background stage reconciliation healed %d request(s)", reconciled)
+
                 if not client.connected:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
