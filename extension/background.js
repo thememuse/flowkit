@@ -45,7 +45,7 @@ const MEDIA_CACHE_STORAGE_KEY = "mediaUrlCacheV1";
 const MEDIA_CACHE_FLUSH_DELAY_MS = 450;
 const TOKEN_CAPTURE_REBROADCAST_MS = 120000;
 const TRAFFIC_COOLDOWN_MS = 15 * 60 * 1000;
-const RECAPTCHA_BLOCK_COOLDOWN_MS = 2 * 60 * 1000;
+const RECAPTCHA_BLOCK_COOLDOWN_MS = 6 * 60 * 1000;
 const STRICT_CLI_FLOW_MODE = true;
 const FLOW_TAB_STABLE_TIMEOUT_MS = 12000;
 const FLOW_TAB_STABLE_MIN_MS = 1200;
@@ -1841,7 +1841,7 @@ async function solveCaptcha(requestId, captchaAction, projectId = "") {
       const resp = await Promise.race([
         requestCaptchaFromTab(targetTab.id, requestId, captchaAction, projectId),
         new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("CAPTCHA_TIMEOUT")), 35000),
+          setTimeout(() => rej(new Error("CAPTCHA_TIMEOUT")), 55000),
         ),
       ]);
 
@@ -2729,7 +2729,7 @@ async function handleApiRequest(msg) {
         const response = await fetch(url, {
           method: methodUpper,
           headers: safeFetchHeaders,
-          credentials: "omit",
+          credentials: "include",
           body: methodUpper === "GET" ? undefined : JSON.stringify(finalBody),
         });
         return {
@@ -2756,6 +2756,11 @@ async function handleApiRequest(msg) {
         }
       } catch (flowTabErr) {
         const flowTabErrMsg = String(flowTabErr?.message || "FLOW_TAB_FETCH_FAILED");
+        // Strict CLI-compatible behavior:
+        // captcha-consuming writes must stay in Flow tab context only.
+        if (preferFlowTabContext && STRICT_CLI_FLOW_MODE) {
+          throw new Error(`FLOW_TAB_CONTEXT_REQUIRED: ${flowTabErrMsg}`);
+        }
         let canRescueByBackgroundFetch =
           flowTabErrMsg.includes("Failed to fetch") ||
           flowTabErrMsg.includes("FLOW_API_TIMEOUT") ||

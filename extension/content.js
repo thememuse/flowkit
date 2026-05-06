@@ -58,7 +58,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   const timer = setTimeout(() => {
     window.removeEventListener('CAPTCHA_RESULT', handler);
     reply({ error: 'CONTENT_TIMEOUT' });
-  }, 25000);
+  }, 45000);
 
   window.addEventListener('CAPTCHA_RESULT', handler);
 
